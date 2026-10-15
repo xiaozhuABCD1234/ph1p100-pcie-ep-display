@@ -1,5 +1,8 @@
-//! 灰度 JPEG 编码。用纯 Rust 的 `jpeg-encoder`，`ColorType::Luma` 走单分量
-//! 路径 —— 出来的就是灰度 JPEG（SOF 里只有 1 个分量），不会推成绿图。
+//! JPEG 编码。用纯 Rust 的 `jpeg-encoder`：`ColorType::Luma` 走单分量路径
+//! （灰度 JPEG，SOF 里只有 1 个分量），`ColorType::Rgb` 走三分量路径（彩色 JPEG）。
+//!
+//! 彩色路径用编码器的默认色度抽样（质量 < 90 时为 4:2:0）。对去马赛克出来的图
+//! 这一步正好顺手压掉一部分马赛克的假彩色，也不额外引入依赖。
 
 use jpeg_encoder::{ColorType, Encoder, EncodingError};
 
@@ -13,6 +16,20 @@ pub fn encode_gray(
     // 灰度图经验压缩比 ~1:4，按 1/2 预分配省掉中途扩容
     let mut out = Vec::with_capacity(gray.len() / 2 + 1024);
     Encoder::new(&mut out, quality).encode(gray, width, height, ColorType::Luma)?;
+    Ok(out)
+}
+
+/// 把 RGB8（每像素 3 字节）编成三分量彩色 JPEG。
+/// `rgb.len()` 必须 ≥ width×height×3。
+pub fn encode_rgb(
+    rgb: &[u8],
+    width: u16,
+    height: u16,
+    quality: u8,
+) -> Result<Vec<u8>, EncodingError> {
+    // 彩色图三通道合起来经验压缩比 ~1:8，按 1/4 预分配
+    let mut out = Vec::with_capacity(rgb.len() / 4 + 1024);
+    Encoder::new(&mut out, quality).encode(rgb, width, height, ColorType::Rgb)?;
     Ok(out)
 }
 
@@ -67,5 +84,25 @@ mod tests {
         assert_eq!(jpeg_component_count(&jpeg), Some(1), "输出必须是灰度 JPEG");
         // 平滑图应该被压到远小于原始数据
         assert!(jpeg.len() < gray.len(), "{} >= {}", jpeg.len(), gray.len());
+    }
+
+    #[test]
+    fn encodes_three_component_color() {
+        let (w, h) = (64u16, 48u16);
+        let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                rgb.push((x * 3 % 256) as u8);
+                rgb.push((y * 5 % 256) as u8);
+                rgb.push(((x + y) % 256) as u8);
+            }
+        }
+        let jpeg = encode_rgb(&rgb, w, h, 80).unwrap();
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
+        assert_eq!(
+            jpeg_component_count(&jpeg),
+            Some(3),
+            "输出必须是三分量彩色 JPEG"
+        );
     }
 }

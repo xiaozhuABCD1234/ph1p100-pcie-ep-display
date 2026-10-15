@@ -240,7 +240,7 @@ fn peer_gone(fd: RawFd) -> bool {
 const INDEX_HTML: &str = r#"<!doctype html>
 <html lang="zh"><head><meta charset="utf-8"><title>display-stream</title></head>
 <body style="margin:0;background:#111;color:#ccc;font-family:sans-serif">
-<h3 style="margin:12px">display-stream —— 灰度 MJPEG</h3>
+<h3 style="margin:12px">display-stream —— MJPEG（灰度或 Bayer 彩色，看 --bayer）</h3>
 <img src="/stream.mjpg" style="width:100%;image-rendering:pixelated" alt="stream">
 <p style="margin:12px">单帧快照：<a style="color:#8cf" href="/snapshot.jpg">/snapshot.jpg</a></p>
 </body></html>
