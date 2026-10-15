@@ -54,6 +54,7 @@ Rust cargo 工程，无 C/C++ 源文件。
     /snapshot.jpg 单帧 JPEG
 
 `curl -o f.jpg http://<板子IP>:8090/snapshot.jpg` 抓一帧；`X-Frame-Seq` 等头带帧序号与几何。
+同时最多 16 条连接，超出直接回 503 并关闭；请求读 5s、请求头总限 10s、响应写 5s 超时，慢/不读的客户端会被关连接。
 
 ## 代码位置
 

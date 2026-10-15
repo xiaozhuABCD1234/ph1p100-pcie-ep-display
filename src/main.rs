@@ -168,6 +168,17 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     if cfg.kind == SourceKind::Pgm && cfg.pgm.is_none() {
         return Err("--source pgm 必须配 --pgm <路径>".into());
     }
+    // 合成源的尺寸闸：乘积也要管，不能只限单个维度（65535×65535 要 4 GiB）
+    if cfg.kind == SourceKind::Synthetic
+        && cfg.width as u64 * cfg.height as u64 > source::MAX_FRAME_BYTES as u64
+    {
+        return Err(format!(
+            "合成源几何 {}x{} 超过上限 {} 字节/帧（--width × --height 太大）",
+            cfg.width,
+            cfg.height,
+            source::MAX_FRAME_BYTES
+        ));
+    }
     Ok(Parsed::Run(Box::new(cfg)))
 }
 
@@ -346,10 +357,14 @@ fn main() -> ExitCode {
     let store = Arc::new(store::FrameStore::new());
     {
         let store = Arc::clone(&store);
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("produce".into())
             .spawn(move || produce(src, store, cfg))
-            .expect("spawn produce");
+        {
+            // 线程建不起来：如实报错退出，不 panic 把整个进程带走
+            eprintln!("取帧线程起不来：{e}");
+            return ExitCode::from(EX_SOURCE);
+        }
     }
 
     if let Err(e) = http::serve(addr, Arc::clone(&store)) {
@@ -430,5 +445,13 @@ mod tests {
     fn help_mentions_bayer_option() {
         assert!(usage().contains("--bayer"));
         assert!(parse_args(&["--help".into()]).is_ok());
+    }
+
+    #[test]
+    fn synthetic_geometry_over_limit_rejected() {
+        let e = run(&["--width", "65535", "--height", "65535"]).unwrap_err();
+        assert!(e.contains("上限"), "{e}");
+        // 上限之内仍应正常通过
+        assert!(run(&["--width", "4096", "--height", "4096"]).is_ok());
     }
 }

@@ -1,7 +1,7 @@
 //! 设备源：从驱动的收帧缓冲节点取帧。所有驱动细节都在 [`crate::driver`]，
 //! 本模块只把它适配成 [`FrameSource`]。
 
-use super::{Frame, FrameSource, SourceError};
+use super::{Frame, FrameSource, SourceError, MAX_FRAME_BYTES};
 use crate::driver::{FrameDevice, SlotError};
 use std::path::Path;
 
@@ -19,7 +19,19 @@ pub struct DeviceSource {
 impl DeviceSource {
     pub fn open(path: &Path, timeout_ms: u32) -> std::io::Result<Self> {
         let dev = FrameDevice::open(path)?;
-        let gray = vec![0u8; dev.info().frame_bytes()];
+        // 驱动报的几何先过上限闸，再分配：畸形/异常的 width×height 不能把进程顶到 abort
+        let bytes = dev.info().frame_bytes();
+        if bytes > MAX_FRAME_BYTES {
+            let i = dev.info();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "驱动报的几何 {}x{} = {} 字节/帧，超过本程序上限 {} 字节",
+                    i.width, i.height, bytes, MAX_FRAME_BYTES
+                ),
+            ));
+        }
+        let gray = vec![0u8; bytes];
         // ioctl 报的 seq/count：0 表示 FPGA 还没往这块缓冲写过帧（空转是正常状态）
         let i = dev.info();
         eprintln!(
@@ -84,7 +96,7 @@ impl FrameSource for DeviceSource {
     }
 
     fn describe(&self) -> String {
-        format!("设备源 {} —— {}", self.dev_path_hint(), self.dev.describe())
+        format!("设备源 —— {}", self.dev.describe())
     }
 
     fn status(&self) -> Option<String> {
@@ -100,13 +112,5 @@ impl FrameSource for DeviceSource {
 impl DeviceSource {
     fn info_bytes(&self) -> usize {
         self.dev.info().frame_bytes()
-    }
-
-    fn dev_path_hint(&self) -> String {
-        let i = self.dev.ioc_info();
-        format!(
-            "vendor=0x{:04x} device=0x{:04x} 驱动版本=0x{:x}",
-            i.vendor, i.device, i.driver_version
-        )
     }
 }

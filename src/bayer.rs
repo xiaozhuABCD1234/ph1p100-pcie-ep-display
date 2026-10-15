@@ -121,6 +121,13 @@ pub fn demosaic(
     if width == 0 || height == 0 {
         return Err(format!("几何非法：{width}x{height}"));
     }
+    // 上限闸：RGB 输出是像素数的 3 倍，不设闸就会在畸形几何上触发分配失败 abort
+    if width as u64 * height as u64 > crate::source::MAX_FRAME_BYTES as u64 {
+        return Err(format!(
+            "几何 {width}x{height} 超过本程序上限 {} 字节/帧",
+            crate::source::MAX_FRAME_BYTES
+        ));
+    }
     if raw.len() < width * height {
         return Err(format!("帧数据不够：{} 字节 < {width}x{height}", raw.len()));
     }

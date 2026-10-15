@@ -3,10 +3,31 @@
 //! 只支持单通道、maxval ≤ 255（`maxval` 小于 255 时按比例拉到 0..255）。
 //! 文件在构造时一次性读进内存，取帧不再碰磁盘。
 
-use super::{Frame, FrameSource, SourceError};
-use std::fs;
-use std::io::{self, ErrorKind};
+use super::{Frame, FrameSource, SourceError, MAX_FRAME_BYTES};
+use std::fs::File;
+use std::io::{self, ErrorKind, Read};
 use std::path::{Path, PathBuf};
+
+/// PGM 文件读取上限：像素上限 ×4（ASCII P2 每个像素最多 4 字节）再加 1 MiB
+/// 头/注释余量。先按上限读，不会把整个（可能很大的）文件吞进内存。
+const MAX_PGM_FILE_BYTES: u64 = (MAX_FRAME_BYTES as u64) * 4 + (1 << 20);
+
+/// 读文件，最多读 `limit` 字节；超出就报错
+fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let f = File::open(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("读 PGM {}：{e}", path.display())))?;
+    let mut buf = Vec::new();
+    f.take(limit + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| io::Error::new(e.kind(), format!("读 PGM {}：{e}", path.display())))?;
+    if buf.len() as u64 > limit {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("PGM {} 超过 {} 字节的读取上限", path.display(), limit),
+        ));
+    }
+    Ok(buf)
+}
 
 pub struct PgmFile {
     path: PathBuf,
@@ -17,8 +38,7 @@ pub struct PgmFile {
 
 impl PgmFile {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let raw = fs::read(path)
-            .map_err(|e| io::Error::new(e.kind(), format!("读 PGM {}：{e}", path.display())))?;
+        let raw = read_bounded(path, MAX_PGM_FILE_BYTES)?;
         let (width, height, gray) = parse_pgm(&raw).map_err(|m| {
             io::Error::new(ErrorKind::InvalidData, format!("{}：{m}", path.display()))
         })?;
@@ -97,10 +117,18 @@ fn parse_pgm(raw: &[u8]) -> Result<(u16, u16, Vec<u8>), String> {
     if maxval == 0 || maxval > 255 {
         return Err(format!("maxval {maxval} 不支持（本程序只认 1..=255）"));
     }
-    let npix = width as usize * height as usize;
-    let mut gray = Vec::with_capacity(npix);
+    // 尺寸上限闸：在分配之前算乘积，别只校验单个维度（65535×65535 要 4 GiB）
+    let npix64 = width as u64 * height as u64;
+    if npix64 > MAX_FRAME_BYTES as u64 {
+        return Err(format!(
+            "尺寸 {width}x{height} = {npix64} 字节超过本程序上限 {} 字节/帧",
+            MAX_FRAME_BYTES
+        ));
+    }
+    let npix = npix64 as usize;
 
     if ascii {
+        let mut gray = Vec::with_capacity(npix);
         for _ in 0..npix {
             let v = num(token(&mut p), "像素")?;
             if v > maxval {
@@ -108,6 +136,7 @@ fn parse_pgm(raw: &[u8]) -> Result<(u16, u16, Vec<u8>), String> {
             }
             gray.push(scale(v, maxval));
         }
+        Ok((width as u16, height as u16, gray))
     } else {
         // P5：maxval 之后恰好一个空白（容忍 CRLF），随后就是裸像素
         if p >= raw.len() || !raw[p].is_ascii_whitespace() {
@@ -118,9 +147,11 @@ fn parse_pgm(raw: &[u8]) -> Result<(u16, u16, Vec<u8>), String> {
         } else {
             1
         };
+        // 先校验长度再分配，畸形头不会先要到 64 MiB 再报错
         if raw.len() - p < npix {
             return Err(format!("像素数据只有 {} 字节，需要 {npix}", raw.len() - p));
         }
+        let mut gray = Vec::with_capacity(npix);
         for &b in &raw[p..p + npix] {
             let v = b as u32;
             if v > maxval {
@@ -128,9 +159,8 @@ fn parse_pgm(raw: &[u8]) -> Result<(u16, u16, Vec<u8>), String> {
             }
             gray.push(scale(v, maxval));
         }
+        Ok((width as u16, height as u16, gray))
     }
-
-    Ok((width as u16, height as u16, gray))
 }
 
 /// maxval < 255 时按比例拉到满量程，避免整张图偏暗
@@ -167,5 +197,12 @@ mod tests {
     fn rejects_color_and_short_data() {
         assert!(parse_pgm(b"P6\n1 1\n255\n").is_err());
         assert!(parse_pgm(b"P5\n4 4\n255\n\x01\x02").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions() {
+        // 65535×65535 = 4294836225 字节，远超 64 MiB 上限；要干净报错，不能 abort
+        let e = parse_pgm(b"P5\n65535 65535\n255\n").unwrap_err();
+        assert!(e.contains("上限"), "{e}");
     }
 }

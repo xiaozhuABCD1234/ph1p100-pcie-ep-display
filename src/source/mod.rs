@@ -9,6 +9,11 @@ pub mod synthetic;
 
 use std::io;
 
+/// 一帧像素字节数的上限，与驱动侧 `ANLOGIC_FRAME_MAX_SLOT_BYTES`（64 MiB）同口径。
+/// 任何尺寸在**分配到内存之前**先过这个闸，超了就干净报错，
+/// 而不是让 `Vec::with_capacity` 触发分配失败（Rust 的分配失败是 abort，不是可处理错误）。
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 /// 一帧单字节灰度图。`gray.len()` 必须等于 `width * height`。
 pub struct Frame {
     pub width: u16,

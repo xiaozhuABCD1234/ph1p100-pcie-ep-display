@@ -55,32 +55,6 @@ const ANLOGIC_IOC_MAGIC: u8 = b'x';
  * 与头文件逐字段对应的结构体（字段名沿用 C 侧，便于对表）
  * ------------------------------------------------------------------ */
 
-/// `struct anlogic_ioc_base`
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AnlogicIocBase {
-    pub magic: u32,
-    pub command: u32,
-}
-
-/// `struct anlogic_ioc_info` —— 用于自检时打印驱动/设备身份
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AnlogicIocInfo {
-    pub base: AnlogicIocBase,
-    pub vendor: u16,
-    pub device: u16,
-    pub subsystem_vendor: u16,
-    pub subsystem_device: u16,
-    pub dma_engine_version: u32,
-    pub driver_version: u32,
-    pub feature_id: u64,
-    pub domain: u16,
-    pub bus: u8,
-    pub dev: u8,
-    pub func: u8,
-}
-
 /// `struct anlogic_ioc_frame` —— `ANLOGIC_IOCFRAMEINFO` 的出入参
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -142,16 +116,26 @@ pub const ANLOGIC_FRAME_FLAG_COMPLETE: u32 = 0x1;
 /// `ANLOGIC_FRAME_MAX_WAIT_MS`
 pub const ANLOGIC_FRAME_MAX_WAIT_MS: u32 = 600_000;
 
-const ANLOGIC_IOC_NOP: u8 = 0;
 const ANLOGIC_IOC_INFO: u8 = 1;
 const ANLOGIC_IOCFRAMEINFO: u8 = 10;
 const ANLOGIC_IOCFRAMEWAIT: u8 = 11;
 
 /// 与 C 侧 `_Static_assert` 等价：布局一旦对不上就编不过，而不是取到错数据。
 const _: () = {
-    assert!(size_of::<AnlogicIocInfo>() == 40);
     assert!(size_of::<AnlogicIocFrame>() == 56);
     assert!(size_of::<AnlogicIocFrameWait>() == 24);
+    // 字段偏移逐条钉死：字段全是同宽同类型，只钉 sizeof 挡不住换序
+    assert!(offset_of!(AnlogicIocFrame, phys_addr) == 0);
+    assert!(offset_of!(AnlogicIocFrame, size) == 8);
+    assert!(offset_of!(AnlogicIocFrame, stride) == 16);
+    assert!(offset_of!(AnlogicIocFrame, slot_bytes) == 20);
+    assert!(offset_of!(AnlogicIocFrame, hdr_bytes) == 24);
+    assert!(offset_of!(AnlogicIocFrame, slots) == 28);
+    assert!(offset_of!(AnlogicIocFrame, width) == 32);
+    assert!(offset_of!(AnlogicIocFrame, height) == 36);
+    assert!(offset_of!(AnlogicIocFrame, seq) == 40);
+    assert!(offset_of!(AnlogicIocFrame, count) == 44);
+    assert!(offset_of!(AnlogicIocFrame, mb_off) == 48);
     assert!(size_of::<FrameMailbox>() == 64);
     assert!(offset_of!(FrameMailbox, magic) == 0);
     assert!(offset_of!(FrameMailbox, seq) == 4);
@@ -165,6 +149,25 @@ const _: () = {
     assert!(offset_of!(FrameSlotHdr, seq) == 0);
     assert!(offset_of!(FrameSlotHdr, len) == 4);
     assert!(offset_of!(FrameSlotHdr, flags) == 8);
+    // ioctl 编号照头文件展开值钉死（与 driver/app/rs/src/ioctl.rs 对齐）；
+    // `ANLOGIC_IOC_INFO` 量的是 `sizeof(struct anlogic_ioc_info) == 40`。
+    assert!(ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_INFO, 40) == 0xc028_7801);
+    assert!(
+        ioc(
+            IOC_READ,
+            ANLOGIC_IOC_MAGIC,
+            ANLOGIC_IOCFRAMEINFO,
+            size_of::<AnlogicIocFrame>()
+        ) == 0x8038_780a
+    );
+    assert!(
+        ioc(
+            IOC_READ | IOC_WRITE,
+            ANLOGIC_IOC_MAGIC,
+            ANLOGIC_IOCFRAMEWAIT,
+            size_of::<AnlogicIocFrameWait>()
+        ) == 0xc018_780b
+    );
 };
 
 /* ------------------------------------------------------------------ *
@@ -274,8 +277,6 @@ pub struct FrameDevice {
     file: OwnedFd,
     map: Mapping,
     info: FrameBufferInfo,
-    /// 驱动/设备身份，只用于启动时打印
-    ioc_info: AnlogicIocInfo,
 }
 
 /// 把系统调用的 errno 包成带上下文的 io::Error
@@ -315,28 +316,6 @@ impl FrameDevice {
                 io::Error::last_os_error(),
             ));
         }
-
-        // 身份信息（失败不影响取帧，只影响启动日志）
-        let mut ioc_info = AnlogicIocInfo {
-            base: AnlogicIocBase {
-                magic: ANLOGIC_FRAME_MAGIC,
-                command: ANLOGIC_IOC_NOP as u32,
-            },
-            ..Default::default()
-        };
-        let ioc_info = match ioctl_ptr(
-            file.as_raw_fd(),
-            ioc(
-                IOC_READ | IOC_WRITE,
-                ANLOGIC_IOC_MAGIC,
-                ANLOGIC_IOC_INFO,
-                size_of::<AnlogicIocInfo>(),
-            ),
-            &mut ioc_info,
-        ) {
-            Ok(()) => ioc_info,
-            Err(_) => AnlogicIocInfo::default(),
-        };
 
         // 问缓冲几何
         let mut raw = AnlogicIocFrame::default();
@@ -392,7 +371,6 @@ impl FrameDevice {
             file,
             map,
             info,
-            ioc_info,
         };
 
         // mailbox 定位靠 ioctl 报的 mb_off，不按常量猜
@@ -410,10 +388,6 @@ impl FrameDevice {
 
     pub fn info(&self) -> &FrameBufferInfo {
         &self.info
-    }
-
-    pub fn ioc_info(&self) -> &AnlogicIocInfo {
-        &self.ioc_info
     }
 
     /// 一行式描述，给启动日志用
@@ -626,4 +600,36 @@ fn check_descriptor(i: &FrameBufferInfo) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ioctl_numbers_match_header() {
+        // 照抄 driver/app/rs/src/ioctl.rs 的同名用例：命令字一旦算错就当场响
+        assert_eq!(
+            ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_INFO, 40),
+            0xc028_7801
+        );
+        assert_eq!(
+            ioc(
+                IOC_READ,
+                ANLOGIC_IOC_MAGIC,
+                ANLOGIC_IOCFRAMEINFO,
+                size_of::<AnlogicIocFrame>()
+            ),
+            0x8038_780a
+        );
+        assert_eq!(
+            ioc(
+                IOC_READ | IOC_WRITE,
+                ANLOGIC_IOC_MAGIC,
+                ANLOGIC_IOCFRAMEWAIT,
+                size_of::<AnlogicIocFrameWait>()
+            ),
+            0xc018_780b
+        );
+    }
 }

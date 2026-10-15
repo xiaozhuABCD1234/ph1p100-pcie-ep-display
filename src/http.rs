@@ -1,12 +1,14 @@
 //! 最小 HTTP 服务：把最新帧以 MJPEG（`multipart/x-mixed-replace`）连续推出去，
-//! 另给一个单帧 JPEG 快照接口。只用 std 的 `TcpListener`，一个连接一个线程。
+//! 另给一个单帧 JPEG 快照接口。只用 std 的 `TcpListener`，一个连接一个线程；
+//! 连接数有准入上限，请求读与响应写都有超时，`accept` 出错按指数退避重试。
 
 use crate::store::{FrameStore, Snapshot};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// multipart 的分界串（请求头里 `boundary=frame`，正文分隔行是 `--frame`）
 const BOUNDARY: &str = "frame";
@@ -16,6 +18,28 @@ const IDLE_PROBE: Duration = Duration::from_secs(5);
 
 /// 请求行最多读多少字节就放弃
 const MAX_REQUEST: usize = 8 * 1024;
+
+/// 同时最多处理多少条连接（准入上限）。超出直接回 503 并关闭，不 spawn 线程：
+/// 只连不发或只连不 recv 的客户端最多占这么多线程栈。
+const MAX_CONNECTIONS: usize = 16;
+
+/// 请求读的单次超时：连上不发请求的连接最多静默这么久
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 读完整条请求头的总时限：每几秒滴一个字节的慢客户端也拖不过这个上限
+const READ_DEADLINE: Duration = Duration::from_secs(10);
+/// 响应写超时：连上不 recv 的客户端最多拖这么久（超时就关连接，不永久阻塞）
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 超限回 503 用的写超时，比正常路径短，免得拖住 accept 循环
+const BUSY_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// `accept` 失败的退避区间（`EMFILE`/`ENFILE`/`ENOBUFS` 等按指数增长）
+const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_millis(500);
+/// `accept` 失败日志降频：错误反复出现也最多每秒一条
+const ACCEPT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 超过准入上限时回给客户端的正文
+const BUSY_BODY: &str = "同时连接数已达上限，请稍后再试\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -34,40 +58,114 @@ pub fn route(path: &str) -> Option<Route> {
     }
 }
 
-/// 阻塞式服务：绑上端口后不会返回（除非 accept 出错）
+/// 阻塞式服务：绑上端口后不会返回。连接数有准入上限，`accept` 出错退避重试，
+/// 不会因为 fd 耗尽而空转烧核或刷爆日志。
 pub fn serve(addr: SocketAddr, store: Arc<FrameStore>) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
+    let live = Arc::new(AtomicUsize::new(0));
+    let mut backoff = ACCEPT_BACKOFF_MIN;
+    // 初始化为「一段时间以前」，保证第一条失败日志一定打得出来
+    let mut last_log = Instant::now() - ACCEPT_LOG_INTERVAL;
+    loop {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                backoff = ACCEPT_BACKOFF_MIN;
+                // 准入：先占名额，超限就回 503 关掉，不进线程
+                let n = live.fetch_add(1, Ordering::AcqRel);
+                if n >= MAX_CONNECTIONS {
+                    live.fetch_sub(1, Ordering::AcqRel);
+                    let _ = refuse_busy(stream);
+                    continue;
+                }
+                let guard = ConnGuard(Arc::clone(&live));
                 let store = Arc::clone(&store);
-                std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("http-client".into())
                     .spawn(move || {
+                        // 名额随本连接存续，drop（含 spawn 失败丢弃闭包）时归还
+                        let _guard = guard;
                         let peer = stream
                             .peer_addr()
                             .map(|a| a.to_string())
                             .unwrap_or_else(|_| "?".into());
                         if let Err(e) = handle(stream, &store) {
-                            // 客户端提前关流是常态，不当错误刷屏
-                            if e.kind() != io::ErrorKind::BrokenPipe
-                                && e.kind() != io::ErrorKind::ConnectionReset
-                                && e.kind() != io::ErrorKind::UnexpectedEof
-                            {
+                            // 客户端提前关流/不发数据是常态，不当错误刷屏
+                            if !is_quiet(&e) {
                                 eprintln!("客户端 {peer}：{e}");
                             }
                         }
-                    })
-                    .expect("spawn http-client");
+                    });
+                if let Err(e) = spawned {
+                    // 线程建不起来（EAGAIN/内核内存不足）：不让整个进程跟着走，
+                    // guard 随失败的闭包一起 drop，名额自动释放
+                    eprintln!("连接线程建不起来，本连接关闭：{e}");
+                }
             }
-            Err(e) => eprintln!("accept 失败：{e}"),
+            Err(e) => {
+                // EINTR / ECONNABORTED 是瞬时的，立刻重试
+                if is_accept_retry(&e) {
+                    continue;
+                }
+                // 其余错误（尤其 fd 耗尽后的 EMFILE/ENFILE）退避，别空转烧核
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(ACCEPT_BACKOFF_MAX);
+                // 降频打印：反复失败也最多每秒一条
+                if last_log.elapsed() >= ACCEPT_LOG_INTERVAL {
+                    eprintln!("accept 失败（已退避到 {}ms）：{e}", backoff.as_millis());
+                    last_log = Instant::now();
+                }
+            }
         }
     }
-    Ok(())
+}
+
+/// `accept` 的瞬时错误：立刻重试即可（不用退避）
+fn is_accept_retry(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// 客户端侧的正常断开/超时：不当作服务端错误刷日志
+fn is_quiet(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
+}
+
+/// 超限时回 503 并关闭（用较短的写超时，避免拖住 accept 循环）
+fn refuse_busy(mut stream: TcpStream) -> io::Result<()> {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(BUSY_WRITE_TIMEOUT));
+    respond(
+        &mut stream,
+        503,
+        "text/plain; charset=utf-8",
+        BUSY_BODY.as_bytes(),
+    )
+}
+
+/// 连接名额守卫：drop 时把「在处理连接数」归还
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn handle(mut stream: TcpStream, store: &FrameStore) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
+    // 读请求与写响应都设超时：连上不发请求、或连上不 recv 的客户端
+    // 都不能永久占着线程（超时按 WouldBlock 返回，连接随即关闭）
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let (method, path) = read_request(&stream)?;
     let route = route(&path);
     let w = &mut stream;
@@ -182,11 +280,19 @@ fn reason(code: u16) -> &'static str {
 }
 
 /// 读请求行。只解析首行的方法与路径，剩下的头一律不看（不使用 keep-alive）。
+/// 单次读有 5s 超时，整条请求头另有总时限，慢客户端拖不住线程。
 fn read_request(stream: &TcpStream) -> io::Result<(String, String)> {
     let mut s = stream; // &TcpStream 本身实现了 Read
     let mut buf = Vec::new();
     let mut tmp = [0u8; 512];
+    let started = Instant::now();
     loop {
+        if started.elapsed() > READ_DEADLINE {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "请求头读取超过总时限",
+            ));
+        }
         let n = s.read(&mut tmp)?;
         if n == 0 {
             return Err(io::Error::new(
