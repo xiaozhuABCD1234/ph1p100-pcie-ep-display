@@ -1,0 +1,11 @@
+[package]
+name = "display-stream"
+version = "0.1.0"
+edition = "2021"
+description = "RK3588 取帧（PCIe EP 收帧缓冲）→ 灰度 JPEG → HTTP 推流"
+
+[dependencies]
+# 纯 Rust JPEG 编码器（无 C 依赖，交叉编译不需要额外系统库）
+jpeg-encoder = "0.7"
+# 仅用于 ioctl / mmap / flock 等系统调用的 FFI 声明
+libc = "0.2"

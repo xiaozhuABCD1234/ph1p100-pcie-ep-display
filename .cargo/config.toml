@@ -1,0 +1,4 @@
+# 交叉编译到板子（aarch64）用 Ubuntu 的交叉 gcc 做链接器。
+# 本机原生构建（cargo build --release）不指定 --target，走默认 x86_64 链接器。
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
