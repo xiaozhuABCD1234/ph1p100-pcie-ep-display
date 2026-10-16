@@ -1,6 +1,6 @@
 # display-stream —— 取帧 → JPEG → HTTP 推流
 
-RK3588 上把安路 PH1P100 EP 送来的帧（默认 640×480）取出来，编成 JPEG，由最小
+RK3588 上把安路 PH1P100 EP 送来的帧（相机整帧 3840×2160）取出来，编成 JPEG，由最小
 HTTP 服务推出去（MJPEG 连续流 + 单帧快照）。默认编成**单分量灰度 JPEG**；
 帧缓存里是 Bayer 马赛克时用 `--bayer <相位>` 做去马赛克，改推**三分量彩色 JPEG**。
 `--auto` 一键打开主机侧后处理（黑电平扣除 + gamma + AE + AWB），把「传感器 RAW
@@ -29,9 +29,12 @@ Rust cargo 工程，无 C/C++ 源文件。
     ./display-stream --source device --fps 30                # 设备源，默认节点见下
     ./display-stream --source device --bayer gbrg            # 只去马赛克，不做后处理
     ./display-stream --source device --auto                  # 灰度通路也能用（无 AWB）
+    ./display-stream --source device \
+        --device /dev/ANLOGIC-PCI0_frame_b --bayer gbrg      # B 路相机（另一颗传感器）
 
 参数：`--source synthetic|pgm|device`（默认 synthetic）、`--pgm <路径>`、
-`--device <节点>`（默认 `/dev/ANLOGIC-PCI0_frame`，需先加载驱动）、
+`--device <节点>`（默认 `/dev/ANLOGIC-PCI0_frame` = A 路相机，需先加载驱动；
+B 路是 `/dev/ANLOGIC-PCI0_frame_b`，命令字完全相同）、
 `--width`/`--height`（合成源几何）、`--fps`（默认 15）、`--quality`（1..100，默认 80）、
 `--bayer <gray|rggb|bggr|grbg|gbrg>`（默认 `gray`，实测应为 `gbrg`）、
 `--auto` / `--black` / `--gamma` / `--ae` / `--awb` / `--no-awb`（后处理，见下节）、
@@ -151,6 +154,16 @@ FPGA 侧现在能把相机整幅 3840×2160 直通到 DDR3（见 `fpga/README.md
 要么加一级降采样（例如先缩到 1080p 再编码），要么接受低帧率看快照
 （`curl -o f.jpg http://<板子IP>:8090/snapshot.jpg`）。
 只取原始帧不走这个工具时用 `frame_grab -o f.pgm`（8.29MB/帧）。
+
+**两路同时看**：两颗相机各推各的，起两个实例、端口分开就是「两路同时出」：
+
+    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame   \
+        --bayer gbrg --auto --port 8098 &
+    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame_b \
+        --bayer gbrg --auto --port 8099 &
+
+实测（Gen2 ×2）：两路各 ≈7.85fps 送进来，两个实例同跑各约 3fps
+（瓶颈在 RK3588 这一侧的 MJPEG 编码，不在链路）。
 
 ## 接口
 

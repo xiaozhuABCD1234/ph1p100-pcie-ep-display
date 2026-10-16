@@ -16,7 +16,9 @@
 //!   5. 核对槽头 seq/len/flags，拷像素，再复查序号是否在搬运期间绕回。
 //!
 //! 缓冲内布局（由驱动分配、FPGA 用 MWr 写入）：
-//!   偏移 0 起 `stride*slots` 是槽区，槽 n 在 `stride*n`，其前 16 字节是槽头；
+//!   每一路内：`stride*slots` 是槽区，槽 n 在 `stride*n`，其前 16 字节是槽头；
+//!   本路在整块缓冲里的起点 = `mb_off - stride*slots`（单路 = 0；A/B 两路时 B 路
+//!   就是第 1 路的起点）—— mmap 映射的是整块缓冲，算槽地址要加这个起点；
 //!   mailbox 在 `mb_off`（页对齐、独占一页），**偏移必须用 ioctl 报的值**，不许按常量猜。
 
 use std::ffi::CString;
@@ -479,7 +481,10 @@ impl FrameDevice {
             )));
         }
 
-        let slot_off = slot as usize * self.info.stride as usize;
+        // 本路在整块缓冲里的起点（见文件头）：槽区恒在路首、mailbox 紧随其后
+        let stream_off = self.info.mb_off as usize -
+                         self.info.stride as usize * self.info.slots as usize;
+        let slot_off = stream_off + slot as usize * self.info.stride as usize;
         let base = unsafe { self.map.as_ptr().add(slot_off) };
 
         // 顺序：先 seq，再 len/flags（与 frame_grab.c 一致）
