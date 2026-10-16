@@ -5,6 +5,7 @@
 //! `--bayer gray`（默认）保持原有的单分量灰度输出。
 //! 推流接口两个：MJPEG 连续流与单帧 JPEG 快照（见 `--help`）。
 
+mod auto;
 mod bayer;
 mod driver;
 mod encode;
@@ -35,8 +36,28 @@ const DEF_FPS: u32 = 15;
 const DEF_QUALITY: u8 = 80;
 const DEF_WAIT_MS: u32 = 2000;
 /// Bayer 相位默认 `gray`：与旧版行为一致（单分量灰度），要彩色得显式指定相位。
-/// 实测（`--bayer` 四相位对比，见 README）首选 `bggr`。
+///
+/// 实测相位是 **`grbg`**（次选 `gbrg`，两者只差红蓝互换）—— 注意这与本仓库早期
+/// README 里写的 `bggr` 相反，那次结论是错的（用的是「假彩色能量最低」这个指标，
+/// 而选错相位会把通道模糊掉、反而让高频能量变低，所以那个指标偏向了错误答案）。
+/// 现在的依据是 2×2 四个格子自身的原始均值（连抓 5 帧完全一致）：
+///   (0,0)=19.11  (1,1)=19.09  |  (0,1)=15.74  (1,0)=15.28
+/// 同一个物理通道的两个采样点应当最接近 —— (0,0)/(1,1) 只差 0.1%，而
+/// (0,1)/(1,0) 差 3% —— 所以绿（马赛克里唯一占两格、且量子效率最高的通道）
+/// 在**主对角线**上，相位只能是 `grbg`/`gbrg`。
+/// 旁证：按 `bggr`/`rggb` 去马赛克时 AWB 算出的 R/B 增益**恰好相等**（0.49/0.49），
+/// 那正是因为它们被接到了同一条对角线上（同一个物理通道）；按 `grbg` 则是
+/// 1.84/2.09 这种「抬红蓝」的常规方向。
+/// `grbg` 与 `gbrg` 在单帧数据上逐像素只差红蓝互换，要定死得用已知颜色的物体。
 const DEF_BAYER: BayerPhase = BayerPhase::Gray;
+/// `--auto` 预设的四个值：
+///  * 黑电平 12 = IMX415 的 10bit black pedestal 50 截成 8 位（`50 >> 2`），板上实测；
+///  * gamma 2.2 = 常规 sRGB 近似；
+///  * AE 目标 100 = 中位数落在中灰附近，不把画面拉满；
+///  * 白平衡默认开（只有彩色相位下才有意义）。
+const DEF_BLACK: u8 = 12;
+const DEF_GAMMA: f32 = 2.2;
+const DEF_AE: u8 = 100;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SourceKind {
@@ -55,6 +76,16 @@ struct Config {
     fps: u32,
     quality: u8,
     bayer: BayerPhase,
+    /// 一键打开「黑电平 + gamma + AE + AWB」（单项可用下面的选项覆盖）
+    auto: bool,
+    /// 黑电平（10bit pedestal 截成 8 位的值），0 = 不扣
+    black: u8,
+    /// gamma 值，1.0 = 不校正
+    gamma: f32,
+    /// AE 目标（gamma 编码后的中位数亮度），0 = 关
+    ae_target: u8,
+    /// 灰世界白平衡开关（只在彩色相位下有效）
+    awb: bool,
     bind: IpAddr,
     port: u16,
     wait_ms: u32,
@@ -71,6 +102,11 @@ impl Default for Config {
             fps: DEF_FPS,
             quality: DEF_QUALITY,
             bayer: DEF_BAYER,
+            auto: false,
+            black: 0,
+            gamma: 1.0,
+            ae_target: 0,
+            awb: false,
             bind: IpAddr::from([0, 0, 0, 0]),
             port: DEF_PORT,
             wait_ms: DEF_WAIT_MS,
@@ -95,6 +131,18 @@ fn usage() -> String {
                                           默认 {DEF_BAYER}（不去马赛克，单分量灰度）；\n\
                                           非 gray 时按该相位双线性去马赛克，\n\
                                           输出三分量彩色 JPEG\n\
+                                          实测相位是 grbg（次选 gbrg），\n\
+                                          要彩色就写 --bayer grbg\n\
+         --auto                           一键打开后处理：黑电平 -{DEF_BLACK}、\n\
+                                          gamma {DEF_GAMMA}、AE 目标 {DEF_AE}、白平衡开；\n\
+                                          下面四项可以单独覆盖（与 --auto 的先后无关）\n\
+         --black <0..64>                  黑电平（IMX415 的 10bit pedestal 50\n\
+                                          截成 8 位就是 12），默认：--auto 时 {DEF_BLACK}，否则 0\n\
+         --gamma <1.0..4.0>               gamma，默认：--auto 时 {DEF_GAMMA}，否则 1.0\n\
+         --ae <0..250>                    AE 目标（gamma 编码后的中位数亮度），0 = 关；\n\
+                                          默认：--auto 时 {DEF_AE}，否则 0\n\
+         --awb / --no-awb                 灰世界白平衡（只在彩色相位下有效），\n\
+                                          默认：--auto 时开，否则关\n\
          --port <端口>                    监听端口，默认 {DEF_PORT}\n\
          --bind <地址>                    监听地址，默认 0.0.0.0\n\
          --timeout-ms <毫秒>              设备源等帧超时，默认 {DEF_WAIT_MS}\n\
@@ -115,6 +163,9 @@ enum Parsed {
 fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut cfg = Config::default();
     let mut i = 0usize;
+    // 后处理四项的“显式给过吗”：None = 跟着 --auto 的预设走
+    let (mut o_black, mut o_gamma, mut o_ae, mut o_awb) =
+        (None::<u8>, None::<f32>, None::<u8>, None::<bool>);
     // 取值辅助：拿下一个参数
     fn value(args: &[String], i: &mut usize, name: &str) -> Result<String, String> {
         *i += 1;
@@ -149,6 +200,15 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 cfg.bayer = BayerPhase::parse(&v)
                     .ok_or_else(|| format!("--bayer 只认 gray/rggb/bggr/grbg/gbrg，收到 '{v}'"))?;
             }
+            // 后处理：`--auto` 是预设，四个单项选项可以覆盖它（解析顺序无关，
+            // 先在 Option 里记下“显式给过没有”，循环结束后再一次性解算）。
+            "--auto" => cfg.auto = true,
+            "--no-auto" => cfg.auto = false,
+            "--black" => o_black = Some(num(&value(args, &mut i, &name)?, &name, 0, 64)? as u8),
+            "--gamma" => o_gamma = Some(fnum(&value(args, &mut i, &name)?, &name, 1.0, 4.0)?),
+            "--ae" => o_ae = Some(num(&value(args, &mut i, &name)?, &name, 0, 250)? as u8),
+            "--awb" => o_awb = Some(true),
+            "--no-awb" => o_awb = Some(false),
             "--port" => cfg.port = num(&value(args, &mut i, &name)?, &name, 1, 65535)? as u16,
             "--timeout-ms" => {
                 let v = value(args, &mut i, &name)?;
@@ -168,6 +228,12 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     if cfg.kind == SourceKind::Pgm && cfg.pgm.is_none() {
         return Err("--source pgm 必须配 --pgm <路径>".into());
     }
+    // 后处理解算：显式值优先，否则取 --auto 的预设（未开 --auto 就是恒等、原样透传）
+    let preset = cfg.auto;
+    cfg.black = o_black.unwrap_or(if preset { DEF_BLACK } else { 0 });
+    cfg.gamma = o_gamma.unwrap_or(if preset { DEF_GAMMA } else { 1.0 });
+    cfg.ae_target = o_ae.unwrap_or(if preset { DEF_AE } else { 0 });
+    cfg.awb = o_awb.unwrap_or(preset);
     // 合成源的尺寸闸：乘积也要管，不能只限单个维度（65535×65535 要 4 GiB）
     if cfg.kind == SourceKind::Synthetic
         && cfg.width as u64 * cfg.height as u64 > source::MAX_FRAME_BYTES as u64
@@ -192,6 +258,16 @@ fn num(s: &str, name: &str, lo: u32, hi: u32) -> Result<u32, String> {
     Ok(v)
 }
 
+fn fnum(s: &str, name: &str, lo: f32, hi: f32) -> Result<f32, String> {
+    let v: f32 = s
+        .parse()
+        .map_err(|_| format!("{name} 需要一个 {lo}..{hi} 的小数，收到 '{s}'"))?;
+    if !v.is_finite() || v < lo || v > hi {
+        return Err(format!("{name} 超出范围（{lo}..{hi}），收到 {v}"));
+    }
+    Ok(v)
+}
+
 /// 按配置造数据源。失败就如实报错退出，不起半个服务。
 fn build_source(cfg: &Config) -> Result<Box<dyn FrameSource>, String> {
     match cfg.kind {
@@ -211,17 +287,30 @@ fn build_source(cfg: &Config) -> Result<Box<dyn FrameSource>, String> {
 
 /// 一帧 → JPEG。`gray` 相位走单分量灰度通路；其余相位先按该相位对整帧做
 /// 双线性去马赛克，再编三分量彩色 JPEG。
-fn encode_frame(frame: &Frame, phase: BayerPhase, quality: u8) -> Result<Vec<u8>, String> {
+///
+/// 后处理（黑电平/gamma/AE/AWB）就地作用在**送去编码的那张图上**：
+///   * 灰度通路：直接处理 `frame.gray`；
+///   * 彩色通路：先按原文（含 pedestal）去马赛克，再对 RGB 做后处理 ——
+///     双线性插值、扣常数、乘常数都是线性运算，先插值再处理与先处理再插值等价，
+///     而这样只需要一张 RGB 中间缓冲。
+fn encode_frame(
+    frame: &mut Frame,
+    phase: BayerPhase,
+    quality: u8,
+    fx: &mut auto::AutoLevel,
+) -> Result<Vec<u8>, String> {
     if phase.is_gray() {
+        fx.apply(&mut frame.gray, frame.width as usize, 1);
         return encode::encode_gray(&frame.gray, frame.width, frame.height, quality)
             .map_err(|e| e.to_string());
     }
-    let rgb = bayer::demosaic(
+    let mut rgb = bayer::demosaic(
         &frame.gray,
         frame.width as usize,
         frame.height as usize,
         phase,
     )?;
+    fx.apply(&mut rgb, frame.width as usize, 3);
     encode::encode_rgb(&rgb, frame.width, frame.height, quality).map_err(|e| e.to_string())
 }
 
@@ -233,14 +322,16 @@ fn produce(mut src: Box<dyn FrameSource>, store: Arc<store::FrameStore>, cfg: Co
     let mut encode_us: u64 = 0;
     let mut last_log = Instant::now();
     let mut io_fails: u32 = 0;
+    // 后处理器带着时域状态（AE/AWB 的滑动平均）跨帧活着
+    let mut fx = auto::AutoLevel::new(cfg.black, cfg.gamma, cfg.ae_target, cfg.awb);
 
     loop {
         let t0 = Instant::now();
         match src.next_frame() {
-            Ok(frame) => {
+            Ok(mut frame) => {
                 io_fails = 0;
                 let t_enc = Instant::now();
-                let jpeg = match encode_frame(&frame, cfg.bayer, cfg.quality) {
+                let jpeg = match encode_frame(&mut frame, cfg.bayer, cfg.quality, &mut fx) {
                     Ok(j) => j,
                     Err(e) => {
                         eprintln!("编码失败（{e}），跳过这一帧");
@@ -258,10 +349,11 @@ fn produce(mut src: Box<dyn FrameSource>, store: Arc<store::FrameStore>, cfg: Co
                     };
                     eprintln!(
                         "已推 {published} 帧（推流序号 {stream_seq}）；最近一帧 {}x{}，\
-                         平均编码 {:.2}ms{extra}",
+                         平均编码 {:.2}ms；{}{extra}",
                         frame.width,
                         frame.height,
                         encode_us as f64 / 1000.0 / published.max(1) as f64,
+                        fx.status(),
                     );
                     last_log = Instant::now();
                 }
@@ -291,6 +383,24 @@ fn produce(mut src: Box<dyn FrameSource>, store: Arc<store::FrameStore>, cfg: Co
     }
 }
 
+/// 后处理参数的一行式描述，给启动日志用
+fn postfx_desc(cfg: &Config) -> String {
+    if cfg.black == 0 && (cfg.gamma - 1.0).abs() < 1e-6 && cfg.ae_target == 0 && !cfg.awb {
+        return "关（原样透传）".to_string();
+    }
+    format!(
+        "黑电平 -{}，gamma {:.2}，AE 目标 {}，白平衡 {}",
+        cfg.black,
+        cfg.gamma,
+        if cfg.ae_target == 0 {
+            "关".to_string()
+        } else {
+            cfg.ae_target.to_string()
+        },
+        if cfg.awb { "开" } else { "关" }
+    )
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cfg = match parse_args(&args) {
@@ -317,8 +427,10 @@ fn main() -> ExitCode {
     // 启动自检：拿一帧定值小图走一遍真实编码路径，确认分量数与相位设置一致
     // （gray → 1 个分量，彩色相位 → 3 个分量），避免设置与输出对不上。
     let want = if cfg.bayer.is_gray() { 1 } else { 3 };
-    let probe = Frame::new(4, 1, vec![0, 64, 128, 255]);
-    match encode_frame(&probe, cfg.bayer, cfg.quality).and_then(|j| {
+    // 自检只看编码器：后处理器这里用恒等参数，免得自检图被 gamma/AE 改写
+    let mut probe = Frame::new(4, 1, vec![0, 64, 128, 255]);
+    let mut probe_fx = auto::AutoLevel::new(0, 1.0, 0, false);
+    match encode_frame(&mut probe, cfg.bayer, cfg.quality, &mut probe_fx).and_then(|j| {
         encode::jpeg_component_count(&j).ok_or_else(|| "输出里找不到 SOF 段".to_string())
     }) {
         Ok(n) if n == want => {
@@ -352,6 +464,14 @@ fn main() -> ExitCode {
         );
     }
     println!("  节奏  ：{} fps", cfg.fps);
+    println!("  后处理：{}", postfx_desc(&cfg));
+    // gray 相位根本没有马赛克可解，AWB 无从生效 —— 显式提醒，别静默什么都不做
+    if cfg.awb && cfg.bayer.is_gray() {
+        println!(
+            "  注意  ：--bayer gray 不做去马赛克，白平衡无从生效；\
+             要彩色请给相位（实测 --bayer grbg）"
+        );
+    }
     println!("  监听  ：http://{addr}/  与  http://{addr}/snapshot.jpg");
 
     let store = Arc::new(store::FrameStore::new());
@@ -420,25 +540,90 @@ mod tests {
     #[test]
     fn encoded_components_follow_phase() {
         // 同一帧：gray 出 1 个分量，四个彩色相位都出 3 个分量，且四者结果不完全相同
-        let frame = Frame::new(8, 8, (0..64).map(|i| ((i * 37 + 11) % 256) as u8).collect());
-        let count = |p: BayerPhase| {
-            let j = encode_frame(&frame, p, 80).expect("编码应当成功");
+        let mut frame = Frame::new(8, 8, (0..64).map(|i| ((i * 37 + 11) % 256) as u8).collect());
+        let mut fx = auto::AutoLevel::new(0, 1.0, 0, false);
+        let count = |frame: &mut Frame, p: BayerPhase, fx: &mut auto::AutoLevel| {
+            let j = encode_frame(frame, p, 80, fx).expect("编码应当成功");
             encode::jpeg_component_count(&j).expect("应当能找到 SOF")
         };
-        assert_eq!(count(BayerPhase::Gray), 1);
+        assert_eq!(count(&mut frame, BayerPhase::Gray, &mut fx), 1);
         for p in [
             BayerPhase::Rggb,
             BayerPhase::Bggr,
             BayerPhase::Grbg,
             BayerPhase::Gbrg,
         ] {
-            assert_eq!(count(p), 3, "相位 {}", p.as_str());
-            assert_ne!(count(p), count(BayerPhase::Gray));
+            assert_eq!(count(&mut frame, p, &mut fx), 3, "相位 {}", p.as_str());
+            assert_ne!(count(&mut frame, p, &mut fx), 1);
         }
         // 相位必须真的改变像素，而不只是换个标签：RGGB 与 GRBG 的结果应当不同
-        let a = encode_frame(&frame, BayerPhase::Rggb, 80).unwrap();
-        let b = encode_frame(&frame, BayerPhase::Grbg, 80).unwrap();
+        let a = encode_frame(&mut frame, BayerPhase::Rggb, 80, &mut fx).unwrap();
+        let b = encode_frame(&mut frame, BayerPhase::Grbg, 80, &mut fx).unwrap();
         assert_ne!(a, b, "不同相位应当产生不同的 JPEG");
+    }
+
+    #[test]
+    fn postfx_defaults_to_identity_and_auto_preset_fills_in() {
+        let c = run(&[]).unwrap();
+        assert_eq!((c.black, c.gamma, c.ae_target, c.awb), (0, 1.0, 0, false));
+        assert!(postfx_desc(&c).contains("透传"), "{}", postfx_desc(&c));
+
+        let c = run(&["--auto"]).unwrap();
+        assert_eq!(
+            (c.black, c.gamma, c.ae_target, c.awb),
+            (DEF_BLACK, DEF_GAMMA, DEF_AE, true)
+        );
+        assert!(postfx_desc(&c).contains("黑电平 -12"), "{}", postfx_desc(&c));
+    }
+
+    #[test]
+    fn postfx_overrides_beat_auto_regardless_of_order() {
+        for args in [
+            vec!["--auto", "--gamma", "1.8", "--no-awb"],
+            vec!["--gamma", "1.8", "--no-awb", "--auto"],
+        ] {
+            let c = run(&args).unwrap();
+            assert_eq!(c.gamma, 1.8, "{args:?}");
+            assert!(!c.awb, "{args:?}");
+            // 没被覆盖的仍走 --auto 预设
+            assert_eq!(c.black, DEF_BLACK, "{args:?}");
+            assert_eq!(c.ae_target, DEF_AE, "{args:?}");
+        }
+        // 单独给一项、不开 --auto：其余保持恒等
+        let c = run(&["--ae", "150"]).unwrap();
+        assert_eq!((c.ae_target, c.black, c.awb), (150, 0, false));
+        let c = run(&["--ae", "0", "--auto"]).unwrap();
+        assert_eq!(c.ae_target, 0, "--ae 0 应当能关掉 --auto 里打开的 AE");
+    }
+
+    #[test]
+    fn postfx_rejects_out_of_range_values() {
+        assert!(run(&["--black", "65"]).is_err());
+        assert!(run(&["--black", "-1"]).is_err());
+        assert!(run(&["--gamma", "0.9"]).is_err());
+        assert!(run(&["--gamma", "4.1"]).is_err());
+        assert!(run(&["--gamma", "abc"]).is_err());
+        assert!(run(&["--ae", "251"]).is_err());
+        assert!(run(&["--black", "64"]).is_ok());
+        assert!(run(&["--gamma", "1.0"]).is_ok());
+    }
+
+    #[test]
+    fn help_mentions_postfx_options() {
+        for opt in ["--auto", "--black", "--gamma", "--ae", "--awb"] {
+            assert!(usage().contains(opt), "帮助里应当有 {opt}");
+        }
+    }
+
+    #[test]
+    fn encode_frame_applies_postfx_to_gray_path() {
+        // 一帧压在 pedestal 上的灰图：开了黑电平+gamma 之后必须不再是原来的字节，
+        // 但分量数仍是 1（不因为后处理就跑偏到彩色通路）
+        let mut frame = Frame::new(4, 4, vec![12u8; 16]);
+        let mut fx = auto::AutoLevel::new(12, 2.2, 0, false);
+        let j = encode_frame(&mut frame, BayerPhase::Gray, 80, &mut fx).unwrap();
+        assert_eq!(encode::jpeg_component_count(&j), Some(1));
+        assert!(frame.gray.iter().all(|&v| v == 0), "pedestal 应当已被扣掉");
     }
 
     #[test]
