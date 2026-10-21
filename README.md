@@ -36,6 +36,7 @@ Rust cargo 工程，无 C/C++ 源文件。
 `--device <节点>`（默认 `/dev/ANLOGIC-PCI0_frame` = A 路相机，需先加载驱动；
 B 路是 `/dev/ANLOGIC-PCI0_frame_b`，命令字完全相同）、
 `--width`/`--height`（合成源几何）、`--fps`（默认 15）、`--quality`（1..100，默认 80）、
+`--scale <1|2|4|8>`（编码前降采样，默认 1 = 不缩，见下面 `--scale` 一节）、
 `--bayer <gray|rggb|bggr|grbg|gbrg>`（默认 `gray`，实测应为 `gbrg`）、
 `--auto` / `--black` / `--gamma` / `--ae` / `--awb` / `--no-awb`（后处理，见下节）、
 `--port`（默认 8090）、`--bind`（默认 0.0.0.0）、`--timeout-ms`（设备源等帧超时，默认 2000）、
@@ -151,7 +152,7 @@ FPGA 侧现在能把相机整幅 3840×2160 直通到 DDR3（见 `fpga/README.md
 设备源的几何是从驱动 ioctl 读的，所以**不用改本工具**；但要知道代价：
 一帧 829 万像素，本工具是单线程纯 Rust，`--auto` + 去马赛克 + JPEG 编码在 RK3588 上
 大概只有几 fps（`--fps` 只是上限，编不过来就以实际速度走）。想在 4K 下流畅推流，
-要么加一级降采样（例如先缩到 1080p 再编码），要么接受低帧率看快照
+用 `--scale 2`（见下一节）就能到十几 fps，或者接受低帧率只看快照
 （`curl -o f.jpg http://<板子IP>:8090/snapshot.jpg`）。
 只取原始帧不走这个工具时用 `frame_grab -o f.pgm`（8.29MB/帧）。
 
@@ -164,6 +165,42 @@ FPGA 侧现在能把相机整幅 3840×2160 直通到 DDR3（见 `fpga/README.md
 
 实测（Gen2 ×2）：两路各 ≈7.85fps 送进来，两个实例同跑各约 3fps
 （瓶颈在 RK3588 这一侧的 MJPEG 编码，不在链路）。
+
+### `--scale`：编码前降采样（4K 想流畅就靠它）
+
+4K 单线程编码是这条通路最大的主机侧瓶颈。`--scale` 在编码前把帧缩到 1/2、1/4 或 1/8：
+
+| 输入 | 通路 | 每帧耗时 | 折算帧率 |
+| --- | --- | --- | --- |
+| 3840×2160 | 灰度 | 61.5 ms | 16.3 fps |
+| 3840×2160 → 1920×1080 | 灰度（盒式均值） | 36.8 ms | 27.2 fps |
+| 3840×2160 | 彩色 + `--auto` | 319 ms | 3.1 fps |
+| 3840×2160 → 1920×1080 | 彩色（**CFA binning**） | 69.6 ms | 14.4 fps |
+| 3840×2160 → 960×540 | 彩色（CFA binning） | 23.3 ms | 43 fps |
+
+（RK3588 实测，4K PGM 源、`--quality 80`。传感器真实帧率是 7.85 fps/路 ⇒ 1/2 已经够用。）
+
+两条通路的缩法不同，别想当然：
+
+* **灰度**：`src/scale.rs` 的盒式均值（`factor×factor` 块求和再归一化），按行累加实现 ——
+  逐像素算下标那版在 RK3588 上要 40ms，按行累加后约 20ms。
+* **彩色**：`bayer::bin_rgb` 做 **CFA binning** —— 2×2 单元里恰好 R/G/G/B 各一个采样，
+  按通道累加就是真正的传感器 binning（无插值、无假彩色）。它把「去马赛克 + 降采样」
+  合成一步，省掉那条 25MB 的全分辨率 RGB 中间缓冲；实测 4K 彩色的 327ms 里，大部分
+  花在去马赛克与全分辨率后处理上，JPEG 本身只占几十毫秒。
+* **不能**先缩 Bayer 再普通去马赛克：那等于把不同滤色片的采样当邻居插值，颜色会糊掉。
+* 只接受 1/2/4/8（2 的幂）：binning 要求块边界与 2×2 相位对齐。
+
+用法：
+
+    ./display-stream --source device --bayer gbrg --auto --scale 2 --fps 15
+
+两路同时（端口分开）：
+
+    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame \
+        --bayer gbrg --auto --scale 2 --port 8098 &
+    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame_b \
+        --bayer gbrg --auto --scale 2 --port 8099 &
 
 ## 接口
 

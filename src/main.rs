@@ -10,6 +10,7 @@ mod bayer;
 mod driver;
 mod encode;
 mod http;
+mod scale;
 mod source;
 mod store;
 
@@ -76,6 +77,8 @@ struct Config {
     height: u16,
     fps: u32,
     quality: u8,
+    /// 编码前盒式降采样倍率（1 = 不缩；彩色通路先全分辨率去马赛克再缩 RGB）
+    scale: u32,
     bayer: BayerPhase,
     /// 一键打开「黑电平 + gamma + AE + AWB」（单项可用下面的选项覆盖）
     auto: bool,
@@ -102,6 +105,7 @@ impl Default for Config {
             height: 480,
             fps: DEF_FPS,
             quality: DEF_QUALITY,
+            scale: 1,
             bayer: DEF_BAYER,
             auto: false,
             black: 0,
@@ -128,6 +132,9 @@ fn usage() -> String {
          --height <像素>                  合成源高度，默认 480\n\
          --fps <帧/秒>                    推流节奏，默认 {DEF_FPS}\n\
          --quality <1..100>               JPEG 质量，默认 {DEF_QUALITY}\n\
+         --scale <1|2|4|8>               编码前降采样 1/N，默认 1（不缩）。灰度走盒式\n\
+                                          均值；彩色走 CFA binning（2×2 块内 R/G/G/B\n\
+                                          各一个采样，去马赛克与降采样一步完成）\n\
          --bayer <gray|rggb|bggr|grbg|gbrg>  帧缓存里 Bayer 马赛克的相位，\n\
                                           默认 {DEF_BAYER}（不去马赛克，单分量灰度）；\n\
                                           非 gray 时按该相位双线性去马赛克，\n\
@@ -196,6 +203,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--height" => cfg.height = num(&value(args, &mut i, &name)?, &name, 1, 65535)? as u16,
             "--fps" => cfg.fps = num(&value(args, &mut i, &name)?, &name, 1, 240)?,
             "--quality" => cfg.quality = num(&value(args, &mut i, &name)?, &name, 1, 100)? as u8,
+            "--scale" => {
+                // 只允许 2 的幂：彩色通路的 CFA binning 要求块边界与 2×2 相位对齐
+                let v = num(&value(args, &mut i, &name)?, &name, 1, 8)?;
+                if !matches!(v, 1 | 2 | 4 | 8) {
+                    return Err(format!("--scale 只认 1/2/4/8（2 的幂），收到 {v}"));
+                }
+                cfg.scale = v;
+            }
             "--bayer" => {
                 let v = value(args, &mut i, &name)?;
                 cfg.bayer = BayerPhase::parse(&v)
@@ -287,32 +302,52 @@ fn build_source(cfg: &Config) -> Result<Box<dyn FrameSource>, String> {
 }
 
 /// 一帧 → JPEG。`gray` 相位走单分量灰度通路；其余相位先按该相位对整帧做
-/// 双线性去马赛克，再编三分量彩色 JPEG。
+/// 双线性去马赛克，再编三分量彩色 JPEG。返回 `(JPEG 字节, 输出宽, 输出高)` ——
+/// 开了 `--scale` 时输出比源图小，调用方必须用返回值而不是源帧几何。
 ///
 /// 后处理（黑电平/gamma/AE/AWB）就地作用在**送去编码的那张图上**：
-///   * 灰度通路：直接处理 `frame.gray`；
-///   * 彩色通路：先按原文（含 pedestal）去马赛克，再对 RGB 做后处理 ——
-///     双线性插值、扣常数、乘常数都是线性运算，先插值再处理与先处理再插值等价，
-///     而这样只需要一张 RGB 中间缓冲。
+///   * 灰度通路：先缩（若开），再后处理 —— 后处理逐像素，先缩省 3/4 的统计与查表；
+///   * 彩色通路：要缩就**直接 CFA binning**（`bayer::bin_rgb`），不缩才全分辨率去马赛克。
+///     实测 4K 彩色 327ms/帧的绝大部分是那条 25MB 的 RGB 中间缓冲，而不是 JPEG；
+///     binning 把「去马赛克 + 降采样」合成一步，省掉整条全分辨率通路。
+///     **不能先缩 Bayer 再普通去马赛克**：那等于把不同滤色片的采样当邻居插值。
 fn encode_frame(
     frame: &mut Frame,
     phase: BayerPhase,
     quality: u8,
+    scale: u32,
     fx: &mut auto::AutoLevel,
-) -> Result<Vec<u8>, String> {
+) -> Result<(Vec<u8>, u16, u16), String> {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let factor = scale as usize;
+
     if phase.is_gray() {
-        fx.apply(&mut frame.gray, frame.width as usize, 1);
-        return encode::encode_gray(&frame.gray, frame.width, frame.height, quality)
-            .map_err(|e| e.to_string());
+        let mut scaled: Option<Vec<u8>> = None;
+        let (ow, oh) = match scale::out_dims(w, h, factor) {
+            Some((ow, oh)) => {
+                scaled = Some(scale::box_gray(&frame.gray, w, h, factor));
+                (ow, oh)
+            }
+            None => (w, h),
+        };
+        let buf: &mut [u8] = match scaled.as_mut() {
+            Some(b) => b,
+            None => &mut frame.gray,
+        };
+        fx.apply(buf, ow, 1);
+        let jpeg = encode::encode_gray(buf, ow as u16, oh as u16, quality)
+            .map_err(|e| e.to_string())?;
+        return Ok((jpeg, ow as u16, oh as u16));
     }
-    let mut rgb = bayer::demosaic(
-        &frame.gray,
-        frame.width as usize,
-        frame.height as usize,
-        phase,
-    )?;
-    fx.apply(&mut rgb, frame.width as usize, 3);
-    encode::encode_rgb(&rgb, frame.width, frame.height, quality).map_err(|e| e.to_string())
+
+    let (mut rgb, ow, oh) = match scale::out_dims(w, h, factor) {
+        Some((ow, oh)) => (bayer::bin_rgb(&frame.gray, w, h, factor, phase)?, ow, oh),
+        None => (bayer::demosaic(&frame.gray, w, h, phase)?, w, h),
+    };
+    fx.apply(&mut rgb, ow, 3);
+    let jpeg = encode::encode_rgb(&rgb, ow as u16, oh as u16, quality)
+        .map_err(|e| e.to_string())?;
+    Ok((jpeg, ow as u16, oh as u16))
 }
 
 /// 取帧线程：取一帧 → 编码 → 放进共享区，按 fps 控节奏；
@@ -332,15 +367,16 @@ fn produce(mut src: Box<dyn FrameSource>, store: Arc<store::FrameStore>, cfg: Co
             Ok(mut frame) => {
                 io_fails = 0;
                 let t_enc = Instant::now();
-                let jpeg = match encode_frame(&mut frame, cfg.bayer, cfg.quality, &mut fx) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        eprintln!("编码失败（{e}），跳过这一帧");
-                        continue;
-                    }
-                };
+                let (jpeg, out_w, out_h) =
+                    match encode_frame(&mut frame, cfg.bayer, cfg.quality, cfg.scale, &mut fx) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            eprintln!("编码失败（{e}），跳过这一帧");
+                            continue;
+                        }
+                    };
                 encode_us += t_enc.elapsed().as_micros() as u64;
-                let stream_seq = store.publish(jpeg, frame.width, frame.height);
+                let stream_seq = store.publish(jpeg, out_w, out_h);
                 published += 1;
 
                 if last_log.elapsed() >= Duration::from_secs(5) {
@@ -351,8 +387,8 @@ fn produce(mut src: Box<dyn FrameSource>, store: Arc<store::FrameStore>, cfg: Co
                     eprintln!(
                         "已推 {published} 帧（推流序号 {stream_seq}）；最近一帧 {}x{}，\
                          平均编码 {:.2}ms；{}{extra}",
-                        frame.width,
-                        frame.height,
+                        out_w,
+                        out_h,
                         encode_us as f64 / 1000.0 / published.max(1) as f64,
                         fx.status(),
                     );
@@ -431,9 +467,11 @@ fn main() -> ExitCode {
     // 自检只看编码器：后处理器这里用恒等参数，免得自检图被 gamma/AE 改写
     let mut probe = Frame::new(4, 1, vec![0, 64, 128, 255]);
     let mut probe_fx = auto::AutoLevel::new(0, 1.0, 0, false);
-    match encode_frame(&mut probe, cfg.bayer, cfg.quality, &mut probe_fx).and_then(|j| {
-        encode::jpeg_component_count(&j).ok_or_else(|| "输出里找不到 SOF 段".to_string())
-    }) {
+    match encode_frame(&mut probe, cfg.bayer, cfg.quality, cfg.scale, &mut probe_fx).and_then(
+        |(j, _, _)| {
+            encode::jpeg_component_count(&j).ok_or_else(|| "输出里找不到 SOF 段".to_string())
+        },
+    ) {
         Ok(n) if n == want => {
             if cfg.bayer.is_gray() {
                 println!("  自检  ：编码器输出单分量（灰度）JPEG，符合预期");
@@ -458,13 +496,25 @@ fn main() -> ExitCode {
     if cfg.bayer.is_gray() {
         println!("  编码  ：单分量灰度 JPEG，质量 {}", cfg.quality);
     } else {
+        let how = if cfg.scale > 1 {
+            "CFA binning（去马赛克+降采样一步）"
+        } else {
+            "Bayer 去马赛克"
+        };
         println!(
-            "  编码  ：Bayer 去马赛克（相位 {}）→ 三分量彩色 JPEG，质量 {}",
+            "  编码  ：{}（相位 {}）→ 三分量彩色 JPEG，质量 {}",
+            how,
             cfg.bayer.as_str(),
             cfg.quality
         );
     }
     println!("  节奏  ：{} fps", cfg.fps);
+    if cfg.scale > 1 {
+        println!(
+            "  缩放  ：编码前 1/{}（灰度：盒式均值；彩色：CFA binning）",
+            cfg.scale
+        );
+    }
     println!("  后处理：{}", postfx_desc(&cfg));
     // gray 相位根本没有马赛克可解，AWB 无从生效 —— 显式提醒，别静默什么都不做
     if cfg.awb && cfg.bayer.is_gray() {
@@ -544,7 +594,7 @@ mod tests {
         let mut frame = Frame::new(8, 8, (0..64).map(|i| ((i * 37 + 11) % 256) as u8).collect());
         let mut fx = auto::AutoLevel::new(0, 1.0, 0, false);
         let count = |frame: &mut Frame, p: BayerPhase, fx: &mut auto::AutoLevel| {
-            let j = encode_frame(frame, p, 80, fx).expect("编码应当成功");
+            let (j, _, _) = encode_frame(frame, p, 80, 1, fx).expect("编码应当成功");
             encode::jpeg_component_count(&j).expect("应当能找到 SOF")
         };
         assert_eq!(count(&mut frame, BayerPhase::Gray, &mut fx), 1);
@@ -558,8 +608,8 @@ mod tests {
             assert_ne!(count(&mut frame, p, &mut fx), 1);
         }
         // 相位必须真的改变像素，而不只是换个标签：RGGB 与 GRBG 的结果应当不同
-        let a = encode_frame(&mut frame, BayerPhase::Rggb, 80, &mut fx).unwrap();
-        let b = encode_frame(&mut frame, BayerPhase::Grbg, 80, &mut fx).unwrap();
+        let (a, _, _) = encode_frame(&mut frame, BayerPhase::Rggb, 80, 1, &mut fx).unwrap();
+        let (b, _, _) = encode_frame(&mut frame, BayerPhase::Grbg, 80, 1, &mut fx).unwrap();
         assert_ne!(a, b, "不同相位应当产生不同的 JPEG");
     }
 
@@ -611,7 +661,7 @@ mod tests {
 
     #[test]
     fn help_mentions_postfx_options() {
-        for opt in ["--auto", "--black", "--gamma", "--ae", "--awb"] {
+        for opt in ["--auto", "--black", "--gamma", "--ae", "--awb", "--scale"] {
             assert!(usage().contains(opt), "帮助里应当有 {opt}");
         }
     }
@@ -622,7 +672,7 @@ mod tests {
         // 但分量数仍是 1（不因为后处理就跑偏到彩色通路）
         let mut frame = Frame::new(4, 4, vec![12u8; 16]);
         let mut fx = auto::AutoLevel::new(12, 2.2, 0, false);
-        let j = encode_frame(&mut frame, BayerPhase::Gray, 80, &mut fx).unwrap();
+        let (j, _, _) = encode_frame(&mut frame, BayerPhase::Gray, 80, 1, &mut fx).unwrap();
         assert_eq!(encode::jpeg_component_count(&j), Some(1));
         assert!(frame.gray.iter().all(|&v| v == 0), "pedestal 应当已被扣掉");
     }
@@ -631,6 +681,42 @@ mod tests {
     fn help_mentions_bayer_option() {
         assert!(usage().contains("--bayer"));
         assert!(parse_args(&["--help".into()]).is_ok());
+    }
+
+    #[test]
+    fn scale_option_parses_and_is_bounded() {
+        assert_eq!(run(&[]).unwrap().scale, 1);
+        for v in ["1", "2", "4", "8"] {
+            assert_eq!(run(&["--scale", v]).unwrap().scale, v.parse().unwrap());
+        }
+        // 非 2 的幂（彩色 binning 要求块边界对齐）一律拒绝
+        for v in ["0", "3", "5", "6", "7", "9"] {
+            assert!(run(&["--scale", v]).is_err(), "--scale {v}");
+        }
+        assert!(run(&["--scale"]).is_err());
+    }
+
+    #[test]
+    fn scale_shrinks_output_dims_on_both_paths() {
+        let src: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let mut fx = auto::AutoLevel::new(0, 1.0, 0, false);
+        for phase in [BayerPhase::Gray, BayerPhase::Gbrg] {
+            let mut frame = Frame::new(8, 8, src.clone());
+            let (j, w, h) = encode_frame(&mut frame, phase, 80, 2, &mut fx).unwrap();
+            assert_eq!((w, h), (4, 4), "相位 {}", phase.as_str());
+            assert_eq!(
+                encode::jpeg_component_count(&j),
+                Some(if phase.is_gray() { 1 } else { 3 })
+            );
+            // 缩过之后源帧本身不该被改动（灰度通路用的是拷贝）
+            if phase.is_gray() {
+                assert_eq!(frame.gray, src);
+            }
+        }
+        // 源图比缩放倍数还小时退回原图，不 panic、不产生 0 维
+        let mut tiny = Frame::new(2, 2, vec![7u8; 4]);
+        let (_, w, h) = encode_frame(&mut tiny, BayerPhase::Gray, 80, 8, &mut fx).unwrap();
+        assert_eq!((w, h), (2, 2));
     }
 
     #[test]

@@ -163,6 +163,77 @@ pub fn demosaic(
     Ok(rgb)
 }
 
+/// CFA binning：**去马赛克 + 降采样一步做**，输出 `(w/factor, h/factor)` 的 RGB8。
+///
+/// 为什么不让上层「先全分辨率 `demosaic`、再 `scale::box_rgb`」：实测 4K 彩色帧
+/// 327ms/帧，其中绝大部分是那条 25MB 的 RGB 中间缓冲（去马赛克 + 逐像素后处理），
+/// 而 JPEG 本身只占几十毫秒。2×2 块里恰好 R/G/G/B 各一个采样 —— 直接按通道
+/// 累加就是**真正的传感器 binning**（无插值、无假彩色），还顺带把中间缓冲缩到 1/4。
+///
+/// 约定：`factor` 必须是 ≥2 的偶数（`--scale` 只允许 1/2/4/8），块边界与 2×2 相位
+/// 对齐，所以每个输出像素拿到的通道数与 2×2 单元一致（R 1 : G 2 : B 1，按面积缩放）。
+pub fn bin_rgb(
+    raw: &[u8],
+    width: usize,
+    height: usize,
+    factor: usize,
+    phase: BayerPhase,
+) -> Result<Vec<u8>, String> {
+    let quad = phase
+        .quad()
+        .ok_or_else(|| "gray 相位不做 binning".to_string())?;
+    if factor < 2 || factor % 2 != 0 {
+        return Err(format!("binning 只接受 ≥2 的偶数倍率，收到 {factor}"));
+    }
+    let (ow, oh) = (width / factor, height / factor);
+    if ow == 0 || oh == 0 {
+        return Err(format!("几何 {width}x{height} 太小，缩不了 1/{factor}"));
+    }
+    if raw.len() < width * height {
+        return Err(format!("帧数据不够：{} 字节 < {width}x{height}", raw.len()));
+    }
+    // 每个输出像素里各通道的采样数：2×2 单元是 1:2:1，factor 越大按 (factor/2)² 放大
+    let mul = ((factor / 2) * (factor / 2)) as u32;
+    let mut count = [0u32; N_CH];
+    for &c in quad.iter() {
+        count[c as usize] += mul;
+    }
+
+    let mut out = vec![0u8; ow * oh * N_CH];
+    let mut acc = vec![0u32; ow * N_CH];
+    for oy in 0..oh {
+        acc.iter_mut().for_each(|v| *v = 0);
+        for dy in 0..factor {
+            let start = (oy * factor + dy) * width;
+            let row = &raw[start..start + width];
+            // 行内按 2 字节一对走：偶数列/奇数列各属于 quad 里固定的两个通道
+            let (c0, c1) = if dy % 2 == 0 {
+                (quad[0] as usize, quad[1] as usize)
+            } else {
+                (quad[2] as usize, quad[3] as usize)
+            };
+            for (ox, chunk) in row.chunks_exact(factor).take(ow).enumerate() {
+                // 一个输出像素覆盖 factor 列 = factor/2 对；偶/奇列的通道固定是 c0/c1
+                let mut s0 = 0u32;
+                let mut s1 = 0u32;
+                for pair in chunk.chunks_exact(2) {
+                    s0 += pair[0] as u32;
+                    s1 += pair[1] as u32;
+                }
+                acc[ox * N_CH + c0] += s0;
+                acc[ox * N_CH + c1] += s1;
+            }
+        }
+        let orow = &mut out[oy * ow * N_CH..(oy + 1) * ow * N_CH];
+        for (o, a) in orow.chunks_exact_mut(N_CH).zip(acc.chunks_exact(N_CH)) {
+            for c in 0..N_CH {
+                o[c] = ((a[c] + count[c] / 2) / count[c]) as u8;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +380,43 @@ mod tests {
         assert!(demosaic(&[], 0, 0, BayerPhase::Rggb).is_err());
         // 1×1 也要能跑（边界夹取）
         assert_eq!(demosaic(&[9], 1, 1, BayerPhase::Rggb).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn bin_rgb_2x2_is_true_binning() {
+        // gbrg 的 2×2 单元：G B / R G
+        //   10 20
+        //   30 40
+        let raw = [10u8, 20, 30, 40];
+        let got = bin_rgb(&raw, 2, 2, 2, BayerPhase::Gbrg).unwrap();
+        // R = 30（只有一个红点）、G = (10+40)/2 = 25、B = 20
+        assert_eq!(got, vec![30, 25, 20]);
+    }
+
+    #[test]
+    fn bin_rgb_factor4_averages_the_whole_block() {
+        // 同一相位、4×4 全同值 → 输出仍是该值（不会因为累加/归一化跑偏）
+        let raw = vec![7u8; 16];
+        let got = bin_rgb(&raw, 4, 4, 4, BayerPhase::Rggb).unwrap();
+        assert_eq!((got.len(), got[0], got[1], got[2]), (3, 7, 7, 7));
+    }
+
+    #[test]
+    fn bin_rgb_matches_box_downsample_of_demosaic_on_flat_input() {
+        // 平场（各点相同）时 binning 与「去马赛克再盒式缩」结果一致
+        let raw = vec![42u8; 8 * 8];
+        let binned = bin_rgb(&raw, 8, 8, 2, BayerPhase::Grbg).unwrap();
+        let full = demosaic(&raw, 8, 8, BayerPhase::Grbg).unwrap();
+        let boxed = crate::scale::box_rgb(&full, 8, 8, 2);
+        assert_eq!(binned, boxed);
+    }
+
+    #[test]
+    fn bin_rgb_rejects_odd_factor_and_gray() {
+        let raw = vec![1u8; 16];
+        assert!(bin_rgb(&raw, 4, 4, 3, BayerPhase::Rggb).is_err());
+        assert!(bin_rgb(&raw, 4, 4, 2, BayerPhase::Gray).is_err());
+        assert!(bin_rgb(&raw[..4], 4, 4, 2, BayerPhase::Rggb).is_err(), "数据不够应当报错");
+        assert!(bin_rgb(&raw, 2, 2, 4, BayerPhase::Rggb).is_err(), "缩到 0 维应当报错");
     }
 }
