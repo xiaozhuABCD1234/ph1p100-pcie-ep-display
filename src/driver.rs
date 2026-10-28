@@ -74,6 +74,17 @@ pub struct AnlogicIocFrame {
     pub mb_off: u32,
 }
 
+/// `struct anlogic_ioc_bar` —— 单 dw 读写
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AnlogicIocBar {
+    pub bar_id: u16,
+    pub bar_type: u16,
+    pub bar_offaddr: u32,
+    pub wdata: u32,
+    pub rdata: u32,
+}
+
 /// `struct anlogic_ioc_frame_wait` —— `ANLOGIC_IOCFRAMEWAIT` 的出入参
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -126,6 +137,7 @@ const ANLOGIC_IOCFRAMEWAIT: u8 = 11;
 const _: () = {
     assert!(size_of::<AnlogicIocFrame>() == 56);
     assert!(size_of::<AnlogicIocFrameWait>() == 24);
+    assert!(size_of::<AnlogicIocBar>() == 16);
     // 字段偏移逐条钉死：字段全是同宽同类型，只钉 sizeof 挡不住换序
     assert!(offset_of!(AnlogicIocFrame, phys_addr) == 0);
     assert!(offset_of!(AnlogicIocFrame, size) == 8);
@@ -439,6 +451,11 @@ impl FrameDevice {
         self.mailbox_u32(offset_of!(FrameMailbox, count))
     }
 
+    /// 读 mailbox 内任意 32 位字段（双路工具用 +32/+36 的门铃）。
+    pub fn mailbox_u32_field(&self, field_off: usize) -> u32 {
+        self.mailbox_u32(field_off)
+    }
+
     /// 等一帧就绪。`last_seq` 是调用方已消费到的序号（0 = 缓冲里有帧就返回），
     /// `timeout_ms` 会被驱动按 `ANLOGIC_FRAME_MAX_WAIT_MS` 夹上限。
     pub fn wait_frame(&self, last_seq: u32, timeout_ms: u32) -> io::Result<WaitResult> {
@@ -464,6 +481,36 @@ impl FrameDevice {
             count: w.count,
             slot: w.slot,
         })
+    }
+
+    /// 取一槽的原始内容（从槽数据偏移起，长度 = 调用方给的 out.len()）。
+    /// 不检查槽头：双路模式 B 槽的槽头不由驱动补，R10F strict 会负责内容校验。
+    pub fn read_slot_raw(&self, slot: u32, out: &mut [u8]) -> Result<(), SlotError> {
+        if slot >= self.info.slots {
+            return Err(SlotError::Inconsistent(format!(
+                "槽位 {slot} 越界（共 {} 槽）",
+                self.info.slots
+            )));
+        }
+        if out.len() < self.info.frame_bytes() {
+            return Err(SlotError::Inconsistent(format!(
+                "目标缓冲 {} 字节小于一槽内容 {} 字节",
+                out.len(),
+                self.info.frame_bytes()
+            )));
+        }
+        let stream_off =
+            self.info.mb_off as usize - self.info.stride as usize * self.info.slots as usize;
+        let slot_off = stream_off + slot as usize * self.info.stride as usize;
+        let src = unsafe {
+            self.map
+                .as_ptr()
+                .add(slot_off + self.info.hdr_bytes as usize)
+        };
+        let n = self.info.frame_bytes().min(out.len());
+        out[n..].fill(0);
+        unsafe { std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n) };
+        Ok(())
     }
 
     /// 取一槽的像素到 `out`（长度必须是宽×高）。槽头检查不通过时返回

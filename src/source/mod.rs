@@ -4,6 +4,7 @@
 //! 内部用 `crate::driver`）。
 
 pub mod device;
+pub mod pair;
 pub mod pgm;
 pub mod r10f_file;
 pub mod synthetic;

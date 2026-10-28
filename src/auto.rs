@@ -163,26 +163,54 @@ impl AutoLevel {
         self.primed = true;
 
         // ---- 4. 建表 + 应用 ----
+        // 逐像素查表是热路径：把通道数分成 3 和 1 两种展开，省掉内层循环与
+        // 每次重算的 dither 下标。帧大小与几何在这之前已经校验过。
         let lut = build_lut(channels, self.gain, &self.wb, self.gamma);
-        let black = self.black as usize;
-        for y in 0..(npx / width) {
-            let drow = (y & 3) * 4;
-            let rowoff = y * width * channels;
-            for x in 0..width {
-                let p = drow + (x & 3);
-                let off = rowoff + x * channels;
-                for c in 0..channels {
-                    let v = buf[off + c] as usize;
-                    buf[off + c] = lut[c * 16 + p][v.saturating_sub(black)];
+        let black = self.black as u8;
+        if channels == 3 {
+            for y in 0..(npx / width) {
+                let drow = (y & 3) * 4;
+                let rowoff = y * width * 3;
+                for x in 0..width {
+                    let p = drow + (x & 3);
+                    let off = rowoff + x * 3;
+                    // SAFETY: off+2 = (y*width+x)*3+2 < npx*3 = buf.len()
+                    unsafe {
+                        let q = buf.as_mut_ptr().add(off);
+                        let v0 = (*q).saturating_sub(black) as usize;
+                        let v1 = (*q.add(1)).saturating_sub(black) as usize;
+                        let v2 = (*q.add(2)).saturating_sub(black) as usize;
+                        let (r, g, b) = (lut[p][v0], lut[16 + p][v1], lut[32 + p][v2]);
+                        // 高光去饱和直接在这一趟里做，省掉一遍 6MB 的往返
+                        let mx = r.max(g).max(b);
+                        if mx > HIGH_START {
+                            let t = ((mx as f32 - HIGH_START as f32) / (255.0 - HIGH_START as f32))
+                                .clamp(0.0, 1.0)
+                                * HIGH_MAX_MIX;
+                            let yl = 0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32;
+                            *q = (r as f32 + (yl - r as f32) * t + 0.5) as u8;
+                            *q.add(1) = (g as f32 + (yl - g as f32) * t + 0.5) as u8;
+                            *q.add(2) = (b as f32 + (yl - b as f32) * t + 0.5) as u8;
+                        } else {
+                            *q = r;
+                            *q.add(1) = g;
+                            *q.add(2) = b;
+                        }
+                    }
+                }
+            }
+        } else {
+            for y in 0..(npx / width) {
+                let drow = (y & 3) * 4;
+                let rowoff = y * width;
+                for x in 0..width {
+                    let p = drow + (x & 3);
+                    let off = rowoff + x;
+                    buf[off] = lut[p][buf[off].saturating_sub(black) as usize];
                 }
             }
         }
-        // ---- 5. 高光去饱和 ----
-        // 灯管等高光在传感器上已经接近/达到饱和，各通道 clipping 点不同会留下
-        // 品红/绿色边。只把「接近白」的像素往亮度拉，不碰正常彩色物体。
-        if channels == 3 {
-            desaturate_highlights(buf, npx);
-        }
+        // 高光去饱和在第 4 步查表时一并做掉了（见上面的注释）
     }
 
     /// AE 的基准亮度：采样点上「白平衡之后的三通道均值」的中位数（单通道就是它自己的中位数）。
@@ -217,8 +245,20 @@ impl AutoLevel {
     }
 }
 
+/// 高光去饱和的起点亮度
+const HIGH_START: u8 = 220;
+/// 高光去饱和最多混到 85%
+const HIGH_MAX_MIX: f32 = 0.85;
+
 /// 高光去饱和：输出域亮度 > 220 的像素按比例向亮度混合，最多 85%。
 /// 只处理 3 通道交错缓冲；npx 是像素数。
+/// 高光去饱和：输出域亮度 > 220 的像素按比例向亮度混合，最多 85%。
+/// 灯管等高光在传感器上已经接近饱和，各通道 clipping 点不同会留下品红/绿色边；
+/// 只把「接近白」的像素往亮度拉，不碰正常彩色物体。
+///
+/// 正式路径已经把它内联进查表循环（少一遍 6MB 往返），这里保留独立实现给
+/// 等价性测试当基准。
+#[cfg(test)]
 fn desaturate_highlights(buf: &mut [u8], npx: usize) {
     const START: f32 = 220.0;
     const FULL: f32 = 255.0;
@@ -319,6 +359,50 @@ fn build_lut(channels: usize, gain: f32, wb: &[f32; 3], gamma: f32) -> Vec<[u8; 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fused_highlight_desaturation_matches_two_pass() {
+        // 内联进查表循环的高光去饱和，必须与「先查表、再单独跑一趟」逐字节一致
+        let (w, h) = (37usize, 11usize);
+        let mut seed = 0x0bad_f00du32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 15) as u8
+        };
+        let base: Vec<u8> = (0..w * h * 3).map(|_| rnd()).collect();
+        // 掺一批高光像素，保证去饱和分支真的被走到
+        let mut input = base.clone();
+        for i in 0..(w * h / 3) {
+            let o = i * 9;
+            if o + 2 < input.len() {
+                input[o] = 250;
+                input[o + 1] = 248;
+                input[o + 2] = 241;
+            }
+        }
+
+        let mut fused = input.clone();
+        let mut fx = AutoLevel::new(6, 2.0, 96, true);
+        fx.apply(&mut fused, w, 3);
+        let lut = build_lut(3, fx.gain, &fx.wb, fx.gamma);
+        let black = fx.black as u8;
+
+        let mut want = input.clone();
+        for y in 0..h {
+            let drow = (y & 3) * 4;
+            let rowoff = y * w * 3;
+            for x in 0..w {
+                let p = drow + (x & 3);
+                let off = rowoff + x * 3;
+                for c in 0..3 {
+                    let v = want[off + c].saturating_sub(black) as usize;
+                    want[off + c] = lut[c * 16 + p][v];
+                }
+            }
+        }
+        desaturate_highlights(&mut want, w * h);
+        assert_eq!(fused, want, "内联去饱和与两趟实现不一致");
+    }
+
     use super::*;
 
     /// 造一张 `channels` 通道的图，`f(x, y, c)` 给出像素值

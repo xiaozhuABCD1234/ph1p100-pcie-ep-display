@@ -92,6 +92,7 @@ impl BayerPhase {
 
 /// 某个相位类别（2×2 里的一种格子）下，某个输出通道可用的邻居偏移。
 /// 最多 4 个：绿点取同轴两个邻居，红/蓝点取四个对角邻居。
+#[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct Offsets {
     xs: [i8; 4],
@@ -101,6 +102,7 @@ struct Offsets {
 
 /// 预计算邻居表：`表[相位类别][输出通道]` → 3×3 邻域里属于该通道的偏移。
 /// 相位类别 = `(y&1)*2 + (x&1)`，所以整帧只有 4 张表，每帧算一次就够。
+#[cfg(test)]
 fn build_offsets(quad: [u8; 4]) -> [[Offsets; N_CH]; 4] {
     let mut table = [[Offsets::default(); N_CH]; 4];
     for (p, per_parity) in table.iter_mut().enumerate() {
@@ -126,9 +128,15 @@ fn build_offsets(quad: [u8; 4]) -> [[Offsets; N_CH]; 4] {
     table
 }
 
-/// Bayer 马赛克 → RGB8（长度 `width*height*3`）。
+/// Bayer 马赛克 → RGB8（长度 width*height*3）。
 ///
-/// 边界按「夹到帧内」处理（越界邻居取边缘像素），因此奇数宽高、1 像素高的帧也能跑。
+/// 双线性插值，边界按「夹到帧内」处理（越界邻居取边缘像素），所以奇数宽高、
+/// 1 像素高的帧也能跑。
+///
+/// 实现上先把 3×3 的邻居索引算成 8 个数，再按「本格是什么颜色」分两种情况：
+///   * 绿点：水平邻居同色、垂直邻居同色，正好是 R 和 B 各两个 → 各取轴向均值；
+///   * 红/蓝点：另外两个通道是绿 + 另一个色 → 绿取四个轴向均值、另一色取四个对角均值。
+/// 这覆盖了四种 Bayer 排布，不需要通用邻居表，也不用逐像素进 3 次分支。
 pub fn demosaic(
     raw: &[u8],
     width: usize,
@@ -151,33 +159,64 @@ pub fn demosaic(
     if raw.len() < width * height {
         return Err(format!("帧数据不够：{} 字节 < {width}x{height}", raw.len()));
     }
-    let table = build_offsets(quad);
     let mut rgb = vec![0u8; width * height * N_CH];
-    let (w_i, h_i) = (width as i32, height as i32);
+    demosaic_into(raw, width, height, quad, &mut rgb);
+    Ok(rgb)
+}
 
+/// 去马赛克主体。quad 是 2×2 单元里四个格子的通道号（0=R 1=G 2=B）。
+///
+/// 索引全部预先算好，内层用裸指针读写：这是每帧 200 万像素的热路径，
+/// 边界检查会占掉三分之一时间。所有下标都能证明落在缓冲内：
+/// row/up/dn 是整行起点，xm/xp 被夹在 0..width-1，dst+2 < width*height*3。
+fn demosaic_into(raw: &[u8], width: usize, height: usize, quad: [u8; 4], out: &mut [u8]) {
+    debug_assert!(raw.len() >= width * height);
+    debug_assert!(out.len() >= width * height * N_CH);
+    let last_row = (height - 1) * width;
+    let src = raw.as_ptr();
+    let dst_ptr = out.as_mut_ptr();
     for y in 0..height {
+        let py = y & 1;
+        let row = y * width;
+        let up = if y == 0 { 0 } else { row - width };
+        let dn = if y + 1 >= height {
+            last_row
+        } else {
+            row + width
+        };
         for x in 0..width {
-            let src = y * width + x;
-            let own = quad[(y & 1) * 2 + (x & 1)] as usize;
-            let dst = src * N_CH;
-            for (c, out) in rgb[dst..dst + N_CH].iter_mut().enumerate() {
-                *out = if own == c {
-                    raw[src]
+            let px = x & 1;
+            let own = quad[py * 2 + px] as usize;
+            let xm = x.saturating_sub(1);
+            let xp = if x + 1 >= width { width - 1 } else { x + 1 };
+            let c = row + x;
+            let dst = c * N_CH;
+            // SAFETY: 见函数文档；up/dn 各行起点加 xm/xp 必在 0..w*h 内，
+            // dst 是第 c 个像素的三字节起点，dst+2 <= w*h*3-1。
+            unsafe {
+                let l = *src.add(row + xm) as u32;
+                let r = *src.add(row + xp) as u32;
+                let u = *src.add(up + x) as u32;
+                let d = *src.add(dn + x) as u32;
+                *dst_ptr.add(dst + own) = *src.add(c);
+                if own == 1 {
+                    // 绿点：水平方向同色、垂直方向同色，两者分别是 R 和 B
+                    let h_ch = quad[py * 2 + (1 - px)] as usize;
+                    let v_ch = quad[(1 - py) * 2 + px] as usize;
+                    *dst_ptr.add(dst + h_ch) = ((l + r + 1) >> 1) as u8;
+                    *dst_ptr.add(dst + v_ch) = ((u + d + 1) >> 1) as u8;
                 } else {
-                    let nb = &table[(y & 1) * 2 + (x & 1)][c];
-                    debug_assert!(nb.n > 0, "每个通道在 3×3 邻域里至少有一个采样点");
-                    let mut sum = 0u32;
-                    for k in 0..nb.n {
-                        let sx = (x as i32 + nb.xs[k] as i32).clamp(0, w_i - 1) as usize;
-                        let sy = (y as i32 + nb.ys[k] as i32).clamp(0, h_i - 1) as usize;
-                        sum += raw[sy * width + sx] as u32;
-                    }
-                    ((sum + nb.n as u32 / 2) / nb.n as u32) as u8
-                };
+                    // 红/蓝点：绿取四个轴向邻居，另一个色取四个对角邻居
+                    let ul = *src.add(up + xm) as u32;
+                    let ur = *src.add(up + xp) as u32;
+                    let dl = *src.add(dn + xm) as u32;
+                    let dr = *src.add(dn + xp) as u32;
+                    *dst_ptr.add(dst + 1) = ((l + r + u + d + 2) >> 2) as u8;
+                    *dst_ptr.add(dst + (2 - own)) = ((ul + ur + dl + dr + 2) >> 2) as u8;
+                }
             }
         }
     }
-    Ok(rgb)
 }
 
 /// CFA binning：**去马赛克 + 降采样一步做**，输出 `(w/factor, h/factor)` 的 RGB8。
@@ -251,8 +290,78 @@ pub fn bin_rgb(
     Ok(out)
 }
 
+/// 改造前的通用实现（邻居表 + 逐像素三通道循环）。
+/// 只用于测试：保证新的算术实现与它逐字节一致，颜色不会因为提速而漂移。
+#[cfg(test)]
+fn demosaic_reference(raw: &[u8], width: usize, height: usize, quad: [u8; 4]) -> Vec<u8> {
+    let table = build_offsets(quad);
+    let mut rgb = vec![0u8; width * height * N_CH];
+    let (w_i, h_i) = (width as i32, height as i32);
+    for y in 0..height {
+        for x in 0..width {
+            let src = y * width + x;
+            let own = quad[(y & 1) * 2 + (x & 1)] as usize;
+            let dst = src * N_CH;
+            for (c, out) in rgb[dst..dst + N_CH].iter_mut().enumerate() {
+                *out = if own == c {
+                    raw[src]
+                } else {
+                    let nb = &table[(y & 1) * 2 + (x & 1)][c];
+                    debug_assert!(nb.n > 0, "每个通道在 3×3 邻域里至少有一个采样点");
+                    let mut sum = 0u32;
+                    for k in 0..nb.n {
+                        let sx = (x as i32 + nb.xs[k] as i32).clamp(0, w_i - 1) as usize;
+                        let sy = (y as i32 + nb.ys[k] as i32).clamp(0, h_i - 1) as usize;
+                        sum += raw[sy * width + sx] as u32;
+                    }
+                    ((sum + nb.n as u32 / 2) / nb.n as u32) as u8
+                };
+            }
+        }
+    }
+    rgb
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_demosaic_matches_reference() {
+        // 逐字节对齐旧实现：提速不能改变任何像素，否则颜色又要重调一遍
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 16) as u8
+        };
+        let sizes = [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (5, 4),
+            (8, 6),
+            (17, 9),
+            (1, 7),
+            (7, 1),
+            (64, 48),
+        ];
+        for (w, h) in sizes {
+            let raw: Vec<u8> = (0..w * h).map(|_| rnd()).collect();
+            for phase in [
+                BayerPhase::Rggb,
+                BayerPhase::Bggr,
+                BayerPhase::Grbg,
+                BayerPhase::Gbrg,
+            ] {
+                let quad = phase.quad().expect("彩相位都有 quad");
+                let mut fast = vec![0u8; w * h * N_CH];
+                demosaic_into(&raw, w, h, quad, &mut fast);
+                let want = demosaic_reference(&raw, w, h, quad);
+                assert_eq!(fast, want, "{w}x{h} {phase:?} 与旧实现不一致");
+            }
+        }
+    }
+
     use super::*;
 
     /// 把 RGB8 按相位图抽成 Bayer 马赛克（测试用的「反向」操作）

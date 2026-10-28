@@ -44,23 +44,38 @@ const BUSY_BODY: &str = "同时连接数已达上限，请稍后再试\n";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
     Index,
-    Stream,
-    Snapshot,
+    PairPage,
+    StreamA,
+    StreamB,
+    SnapshotA,
+    SnapshotB,
+    Stats,
 }
 
-/// 路由表：查询串（`?…`）已由调用方剥掉
+/// 路由表：查询串（`?…`）已由调用方剥掉。
+/// 旧路径全部保留并指向 A 路；双路新增 `_a/_b/pair`。
 pub fn route(path: &str) -> Option<Route> {
     match path {
         "/" | "/index.html" => Some(Route::Index),
-        "/stream.mjpg" | "/stream" | "/mjpeg" => Some(Route::Stream),
-        "/snapshot.jpg" | "/snapshot" => Some(Route::Snapshot),
+        "/pair" | "/pair.html" => Some(Route::PairPage),
+        "/stream.mjpg" | "/stream" | "/mjpeg" | "/stream_a.mjpg" | "/stream_a" => {
+            Some(Route::StreamA)
+        }
+        "/stream_b.mjpg" | "/stream_b" => Some(Route::StreamB),
+        "/snapshot.jpg" | "/snapshot" | "/snapshot_a.jpg" | "/snapshot_a" => Some(Route::SnapshotA),
+        "/snapshot_b.jpg" | "/snapshot_b" => Some(Route::SnapshotB),
+        "/stats" | "/stats.json" => Some(Route::Stats),
         _ => None,
     }
 }
 
 /// 阻塞式服务：绑上端口后不会返回。连接数有准入上限，`accept` 出错退避重试，
 /// 不会因为 fd 耗尽而空转烧核或刷爆日志。
-pub fn serve(addr: SocketAddr, store: Arc<FrameStore>) -> io::Result<()> {
+pub fn serve(
+    addr: SocketAddr,
+    store: Arc<FrameStore>,
+    b_store: Option<Arc<FrameStore>>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(addr)?;
     let live = Arc::new(AtomicUsize::new(0));
     let mut backoff = ACCEPT_BACKOFF_MIN;
@@ -79,6 +94,7 @@ pub fn serve(addr: SocketAddr, store: Arc<FrameStore>) -> io::Result<()> {
                 }
                 let guard = ConnGuard(Arc::clone(&live));
                 let store = Arc::clone(&store);
+                let b_store = b_store.as_ref().map(Arc::clone);
                 let spawned = std::thread::Builder::new()
                     .name("http-client".into())
                     .spawn(move || {
@@ -88,7 +104,7 @@ pub fn serve(addr: SocketAddr, store: Arc<FrameStore>) -> io::Result<()> {
                             .peer_addr()
                             .map(|a| a.to_string())
                             .unwrap_or_else(|_| "?".into());
-                        if let Err(e) = handle(stream, &store) {
+                        if let Err(e) = handle(stream, &store, b_store.as_deref()) {
                             // 客户端提前关流/不发数据是常态，不当错误刷屏
                             if !is_quiet(&e) {
                                 eprintln!("客户端 {peer}：{e}");
@@ -160,7 +176,11 @@ impl Drop for ConnGuard {
     }
 }
 
-fn handle(mut stream: TcpStream, store: &FrameStore) -> io::Result<()> {
+fn handle(
+    mut stream: TcpStream,
+    store: &FrameStore,
+    b_store: Option<&FrameStore>,
+) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
     // 读请求与写响应都设超时：连上不发请求、或连上不 recv 的客户端
     // 都不能永久占着线程（超时按 WouldBlock 返回，连接随即关闭）
@@ -179,37 +199,84 @@ fn handle(mut stream: TcpStream, store: &FrameStore) -> io::Result<()> {
         );
     }
     match route {
-        Some(Route::Index) => respond(w, 200, "text/html; charset=utf-8", INDEX_HTML.as_bytes()),
-        Some(Route::Snapshot) => match store.latest() {
-            Some(snap) => {
-                let mut head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\
-                     Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n\
-                     X-Frame-Seq: {}\r\nX-Image-Width: {}\r\nX-Image-Height: {}\r\n\
-                     Connection: close\r\n\r\n",
-                    snap.jpeg.len(),
-                    snap.seq,
-                    snap.width,
-                    snap.height
-                );
-                w.write_all(head.as_bytes())?;
-                head.clear();
-                w.write_all(&snap.jpeg)?;
-                w.flush()
-            }
-            None => respond(
-                w,
-                503,
-                "text/plain; charset=utf-8",
-                "还没有帧：数据源还没产出（FPGA 未接上时设备源会一直空转）\n".as_bytes(),
-            ),
+        // 单路/双路共用同一套前端：页面按 /stats 的 pair 字段决定是否显示 B 路。
+        Some(Route::Index) | Some(Route::PairPage) => {
+            respond(w, 200, "text/html; charset=utf-8", APP_HTML.as_bytes())
+        }
+        Some(Route::StreamA) => stream_mjpeg(w, store),
+        Some(Route::StreamB) => match b_store {
+            Some(b) => stream_mjpeg(w, b),
+            None => no_b(w),
         },
-        Some(Route::Stream) => stream_mjpeg(w, store),
+        Some(Route::SnapshotA) => snapshot(w, store),
+        Some(Route::SnapshotB) => match b_store {
+            Some(b) => snapshot(w, b),
+            None => no_b(w),
+        },
+        Some(Route::Stats) => {
+            // 页面每秒轮询一次：序号用于计算帧率，几何用于 HUD，
+            // pair 决定是否显示 B 路。两路每对同时 publish，所以最小序号
+            // 就是已完成的采集对数。
+            let a_snap = store.latest();
+            let b_snap = b_store.and_then(|s| s.latest());
+            let a = a_snap.as_ref().map(|s| s.seq).unwrap_or(0);
+            let b = b_snap.as_ref().map(|s| s.seq).unwrap_or(0);
+            let pair = b_store.is_some();
+            let pair_seq = if pair { a.min(b) } else { 0 };
+            let (width, height) = a_snap
+                .as_ref()
+                .or(b_snap.as_ref())
+                .map(|s| (s.width, s.height))
+                .unwrap_or((0, 0));
+            let a_fps = store.fps();
+            let b_fps = b_store.map(|s| s.fps()).unwrap_or(0.0);
+            let body = format!(
+                "{{\"pair\":{pair},\"a_seq\":{a},\"b_seq\":{b},\"pair_seq\":{pair_seq},\
+                  \"width\":{width},\"height\":{height},\
+                  \"a_fps\":{a_fps:.1},\"b_fps\":{b_fps:.1}}}\n"
+            );
+            respond(w, 200, "application/json", body.as_bytes())
+        }
         None => respond(
             w,
             404,
             "text/plain; charset=utf-8",
             "没有这个路径\n".as_bytes(),
+        ),
+    }
+}
+
+fn no_b(w: &mut TcpStream) -> io::Result<()> {
+    respond(
+        w,
+        503,
+        "text/plain; charset=utf-8",
+        "当前不是双路模式（用 --source device-pair 启动）\n".as_bytes(),
+    )
+}
+
+fn snapshot(w: &mut TcpStream, store: &FrameStore) -> io::Result<()> {
+    match store.latest() {
+        Some(snap) => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\
+                 Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n\
+                 X-Frame-Seq: {}\r\nX-Image-Width: {}\r\nX-Image-Height: {}\r\n\
+                 Connection: close\r\n\r\n",
+                snap.jpeg.len(),
+                snap.seq,
+                snap.width,
+                snap.height
+            );
+            w.write_all(head.as_bytes())?;
+            w.write_all(&snap.jpeg)?;
+            w.flush()
+        }
+        None => respond(
+            w,
+            503,
+            "text/plain; charset=utf-8",
+            "还没有帧：数据源还没产出（FPGA 未接上时设备源会一直空转）\n".as_bytes(),
         ),
     }
 }
@@ -260,6 +327,7 @@ fn write_part(w: &mut TcpStream, snap: &Snapshot) -> io::Result<()> {
 fn respond(w: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n\r\n",
         reason(code),
         body.len()
@@ -343,14 +411,9 @@ fn peer_gone(fd: RawFd) -> bool {
     n == 0
 }
 
-const INDEX_HTML: &str = r#"<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>display-stream</title></head>
-<body style="margin:0;background:#111;color:#ccc;font-family:sans-serif">
-<h3 style="margin:12px">display-stream —— MJPEG（灰度或 Bayer 彩色，看 --bayer）</h3>
-<img src="/stream.mjpg" style="width:100%;image-rendering:pixelated" alt="stream">
-<p style="margin:12px">单帧快照：<a style="color:#8cf" href="/snapshot.jpg">/snapshot.jpg</a></p>
-</body></html>
-"#;
+/// 前端构建产物（`cd web && npm run build`）：Vite 打成单个 HTML，
+/// JS/CSS 全部内联，板端不需要 Node，也不依赖外部 CDN。
+const APP_HTML: &str = include_str!("../web/dist/index.html");
 
 #[cfg(test)]
 mod tests {
@@ -359,9 +422,13 @@ mod tests {
     #[test]
     fn routes_and_query_strings() {
         assert_eq!(route("/"), Some(Route::Index));
-        assert_eq!(route("/stream.mjpg"), Some(Route::Stream));
-        assert_eq!(route("/stream"), Some(Route::Stream));
-        assert_eq!(route("/snapshot.jpg"), Some(Route::Snapshot));
+        assert_eq!(route("/stream.mjpg"), Some(Route::StreamA));
+        assert_eq!(route("/stream"), Some(Route::StreamA));
+        assert_eq!(route("/snapshot.jpg"), Some(Route::SnapshotA));
+        assert_eq!(route("/stream_b.mjpg"), Some(Route::StreamB));
+        assert_eq!(route("/snapshot_b.jpg"), Some(Route::SnapshotB));
+        assert_eq!(route("/pair"), Some(Route::PairPage));
+        assert_eq!(route("/stats"), Some(Route::Stats));
         assert_eq!(route("/nope"), None);
     }
 
@@ -372,7 +439,7 @@ mod tests {
         assert_eq!(normalize_target("/"), "/");
         assert_eq!(
             route(&normalize_target("/snapshot.jpg?t=1")),
-            Some(Route::Snapshot)
+            Some(Route::SnapshotA)
         );
     }
 }
