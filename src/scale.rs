@@ -1,12 +1,40 @@
-//! 盒式降采样：编码前先把帧缩小，把 CPU 侧的 JPEG 耗时按面积比降下来。
+//! 编码前降采样：把 CPU 侧的像素工作量按面积比降下来。
 //!
-//! 本板实测（RK3588，4K 3840×2160）：灰度 JPEG 66.7ms/帧、Bayer+`--auto` 彩色
-//! 327ms/帧，瓶颈是单线程 JPEG 编码而不是链路。缩到 1/2 后像素数只剩 1/4，
-//! 编码耗时大致也降到 1/4。
+//! 两条通路共用**同一条倍率规则**（[`effective_factor`]）：
+//!   * 灰度：[`box_gray`]，每个 `factor×factor` 块取均值；
+//!   * 彩色：`bayer::bin_rgb`，**在 Bayer 域按通道各自累加**（真正的 CFA binning），
+//!     去马赛克与降采样一步完成。
 //!
-//! **顺序很重要**：彩色通路必须「先全分辨率去马赛克，再缩 RGB」。
-//! 直接缩 Bayer 会把不同滤色片的采样平均到一起（绿和红/蓝混），颜色就废了 ——
-//! 这是 binning 与「缩马赛克」的本质区别，别为了省一次全分辨率去马赛克而搞错。
+//! 彩色**不能**把 2×2 块里的 4 个采样当灰度直接平均：那是把不同滤色片混在一起
+//! （绿和红/蓝混），颜色就废了。`bin_rgb` 只把同一通道的格子相加再除采样数，
+//! 等价于「同色像素求平均」，不引入假彩色 —— 区别在累加时就按通道分开，不是
+//! 「缩完再插值」。
+//!
+//! 1080p 及以下默认 `factor = 1`（全链路原样）；像素数超过
+//! [`AUTO_BIN_MIN_PIXELS`]（4K = 8.3 Mpx）时默认自动 2×2，把中间缓冲与后处理
+//! 面积降到 1/4 —— 4K 全尺寸彩色要保留一条 24.9 MB 的 RGB 中间缓冲，预览会卡死。
+
+/// 单帧超过这个像素数就自动 2×2 binning。
+///
+/// 1080p = 2,073,600（不缩），4K = 8,294,400（缩）；取 4.0 Mpx 让两类几何各留余量，
+/// 也避免 2560×1440 这类介于两者之间的尺寸被误缩。
+pub const AUTO_BIN_MIN_PIXELS: usize = 4_000_000;
+
+/// 有效降采样倍率 —— 整个程序只有这一条规则。
+///
+/// 显式 `--scale N`（N > 1）按 N；默认 1 表示「自动」：像素数超过
+/// [`AUTO_BIN_MIN_PIXELS`] 时取 2，否则取 1（不缩）。1080p 因此永远是 1，
+/// 行为与加这条规则之前逐字节一致。
+pub fn effective_factor(w: usize, h: usize, requested: u32) -> usize {
+    if requested > 1 {
+        return requested as usize;
+    }
+    if (w as u64) * (h as u64) > AUTO_BIN_MIN_PIXELS as u64 {
+        2
+    } else {
+        1
+    }
+}
 
 /// 缩小后的输出几何。`factor <= 1`、或缩小后任一维变成 0 时返回 `None`
 /// （调用方原样使用原图，不做任何拷贝）。
@@ -128,6 +156,26 @@ mod tests {
         let src = vec![9u8; 15];
         assert_eq!(box_gray(&src, 5, 3, 2), vec![9, 9]);
         assert_eq!(out_dims(5, 3, 2), Some((2, 1)));
+    }
+
+    #[test]
+    fn auto_factor_leaves_1080p_alone_and_bins_4k() {
+        // 默认（--scale 1）= 自动：1080p 不缩，4K 缩 2×2
+        assert_eq!(effective_factor(1920, 1080, 1), 1);
+        assert_eq!(effective_factor(3840, 2160, 1), 2);
+        // 更小的合成源同样不缩
+        assert_eq!(effective_factor(960, 540, 1), 1);
+        assert_eq!(effective_factor(640, 480, 1), 1);
+        // 显式倍率永远优先：4K 也可以被指定成 4 或 8
+        assert_eq!(effective_factor(3840, 2160, 2), 2);
+        assert_eq!(effective_factor(3840, 2160, 4), 4);
+        assert_eq!(effective_factor(1920, 1080, 4), 4);
+        // 阈值两侧（按像素总数，与宽高比无关）
+        assert_eq!(effective_factor(2000, 2000, 1), 1, "4.0 Mpx 恰好不缩");
+        assert_eq!(effective_factor(2001, 2000, 1), 2, "超过 4.0 Mpx 才缩");
+        // 0 维不会算出奇怪倍率
+        assert_eq!(effective_factor(0, 0, 1), 1);
+        assert_eq!(effective_factor(0, 5000, 1), 1);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 
 mod auto;
 mod bayer;
+#[cfg(test)]
+mod bench4k;
 mod detect;
 mod driver;
 mod encode;
@@ -90,7 +92,8 @@ struct Config {
     height: u16,
     fps: u32,
     quality: u8,
-    /// 编码前盒式降采样倍率（1 = 不缩；彩色通路先全分辨率去马赛克再缩 RGB）
+    /// 编码前降采样倍率：>1 按该倍率；1 = 自动（≤4.0 Mpx 不缩，超过自动 2×2）。
+    /// 灰度走盒式均值，彩色走 CFA binning —— 规则见 `scale::effective_factor`。
     scale: u32,
     /// 硬件 JPEG 编码节点；None = 只用软件编码
     jpeg_dev: Option<PathBuf>,
@@ -183,11 +186,12 @@ fn usage() -> String {
          --height <像素>                  合成源高度，默认 480\n\
          --fps <帧/秒>                    推流节奏，默认 {DEF_FPS}\n\
          --quality <1..100>               JPEG 质量，默认 {DEF_QUALITY}\n\
-         --scale <1|2|4|8>               编码前降采样 1/N，默认 1（不缩）。灰度走盒式
-         --jpeg-dev <节点>                硬件 JPEG 编码节点，默认 /dev/video4（存在即启用）
+         --scale <1|2|4|8>               编码前降采样 1/N，默认 1（自动）：1080p 及以下\n\
+                                          不缩；超过 4.0 Mpx（4K）自动 2×2。灰度走盒式均值，\n\
+                                          彩色走 CFA binning（2×2 块内 R/G/G/B 各一个采样，\n\
+                                          去马赛克与降采样一步完成）\n\
+         --jpeg-dev <节点>                硬件 JPEG 编码节点，默认 /dev/video4（存在即启用）\n\
          --no-hw-jpeg                     只用软件编码（对比/排查用）\n\
-                                          均值；彩色走 CFA binning（2×2 块内 R/G/G/B\n\
-                                          各一个采样，去马赛克与降采样一步完成）\n\
          --bayer <auto|gray|rggb|bggr|grbg|gbrg>  帧缓存里 Bayer 马赛克的相位，\n\
                                           默认 {DEF_BAYER}：当前安装 A/B 均 RGGB；\n\
                                           gray = 不去马赛克、单分量灰度；\n\
@@ -433,16 +437,6 @@ fn build_source(cfg: &Config) -> Result<BuiltSource, String> {
     }
 }
 
-/// 一帧 → JPEG。`gray` 相位走单分量灰度通路；其余相位先按该相位对整帧做
-/// 双线性去马赛克，再编三分量彩色 JPEG。返回 `(JPEG 字节, 输出宽, 输出高)` ——
-/// 开了 `--scale` 时输出比源图小，调用方必须用返回值而不是源帧几何。
-///
-/// 后处理（黑电平/gamma/AE/AWB）就地作用在**送去编码的那张图上**：
-///   * 灰度通路：先缩（若开），再后处理 —— 后处理逐像素，先缩省 3/4 的统计与查表；
-///   * 彩色通路：要缩就**直接 CFA binning**（`bayer::bin_rgb`），不缩才全分辨率去马赛克。
-///     实测 4K 彩色 327ms/帧的绝大部分是那条 25MB 的 RGB 中间缓冲，而不是 JPEG；
-///     binning 把「去马赛克 + 降采样」合成一步，省掉整条全分辨率通路。
-///     **不能先缩 Bayer 再普通去马赛克**：那等于把不同滤色片的采样当邻居插值。
 /// 硬件 JPEG 的懒加载包装。
 ///
 /// VEPU121 在 RK3588 上只有一个实例，A/B 两路共用它：RGB→NV12 在锁外并行做，
@@ -587,6 +581,17 @@ impl StageTimer {
     }
 }
 
+/// 一帧 → JPEG。`gray` 相位走单分量灰度通路；其余相位按该相位去马赛克，
+/// 再编三分量彩色 JPEG。返回 `(JPEG 字节, 输出宽, 输出高)` —— 缩过时输出比源图小，
+/// 调用方必须用返回值而不是源帧几何。
+///
+/// 倍率只有一条规则（[`scale::effective_factor`]）：显式 `--scale N > 1` 按 N；
+/// 默认 1 表示自动 —— 1080p 及以下不缩，超过 4.0 Mpx（4K）自动 2×2。
+/// 灰度与彩色共用这个倍率：
+///   * 灰度：先盒式缩，再后处理 —— 后处理逐像素，先缩省 3/4 的统计与查表；
+///   * 彩色：要缩就**直接 CFA binning**（`bayer::bin_rgb`），不缩才全分辨率去马赛克。
+///     binning 把「去马赛克 + 降采样」合成一步，整条全分辨率 RGB 中间缓冲都不存在。
+///     **不能先缩 Bayer 再普通去马赛克**：那等于把不同滤色片的采样当邻居插值。
 fn encode_frame(
     frame: &mut Frame,
     phase: BayerPhase,
@@ -601,7 +606,7 @@ fn encode_frame(
     // auto 必须在拿到帧之后解析：A/B 两路的 R/B 顺序不同，R10F header 自己不可信。
     let phase = phase.resolve(frame.camera_id);
     let (w, h) = (frame.width as usize, frame.height as usize);
-    let factor = scale as usize;
+    let factor = scale::effective_factor(w, h, scale);
 
     if phase.is_gray() {
         let mut scaled: Option<Vec<u8>> = None;
@@ -742,6 +747,9 @@ fn produce(
                         encode_us as f64 / 1000.0 / published.max(1) as f64,
                         fx.status(),
                     );
+                    if let Some(line) = tm.report_and_reset() {
+                        eprintln!("{line}");
+                    }
                     last_log = Instant::now();
                 }
             }
@@ -1052,10 +1060,12 @@ fn main() -> ExitCode {
     if cfg.bayer.is_gray() {
         println!("  编码  ：单分量灰度 JPEG，质量 {}", cfg.quality);
     } else {
+        // 默认倍率依赖帧几何（1080p 不缩、4K 自动 2×2），启动时只能报规则；
+        // 实际输出尺寸在周期日志「最近一帧 WxH」里可见。
         let how = if cfg.scale > 1 {
-            "CFA binning（去马赛克+降采样一步）"
+            format!("CFA binning 1/{}（去马赛克+降采样一步）", cfg.scale)
         } else {
-            "Bayer 去马赛克"
+            "自动（1080p 及以下去马赛克，4K 走 2×2 CFA binning）".to_string()
         };
         println!(
             "  编码  ：{}（相位 {}）→ 三分量彩色 JPEG，质量 {}",
@@ -1069,6 +1079,11 @@ fn main() -> ExitCode {
         println!(
             "  缩放  ：编码前 1/{}（灰度：盒式均值；彩色：CFA binning）",
             cfg.scale
+        );
+    } else {
+        println!(
+            "  缩放  ：自动（≤{} 像素不缩；超过则 2×2，灰度盒式 / 彩色 CFA binning）",
+            scale::AUTO_BIN_MIN_PIXELS
         );
     }
     println!("  后处理：{}", postfx_desc(&cfg));

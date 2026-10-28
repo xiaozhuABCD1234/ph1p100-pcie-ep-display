@@ -3,11 +3,11 @@
 RK3588 上把安路 PH1P100 EP 送来的相机帧取出、去马赛克/后处理、编成 JPEG，由最小
 HTTP 服务推出去（MJPEG 连续流 + 单帧快照）。
 
-> 2026-10-28 状态：当前正式通路是 **1920×1080 ROI、packed RAW10、R10F v1**，
-> 一帧传输 **2,592,768 B**（128 B 头 + 2,592,000 B 载荷 + 640 B 尾零）。
-> 驱动只创建一个 <code>/dev/ANLOGIC-PCI0_frame</code> 节点，但现在是**两槽**：
-> 槽 0=A、槽 1=B。display 新增 <code>--source device-pair</code>，自己写 pair 寄存器、
-> 一次 <code>ARM_PAIR/ACK_PAIR</code> 取同一曝光对，输出 A/B/pair 三个视图。
+> 当前通路：**3840×2160 packed RAW10、R10F v1**，一帧传输 **10,371,072 B**
+> （128 B 头 + 10,368,000 B 载荷 + 2,944 B 尾零，= 2532 × 4 KiB）。
+> 驱动只创建一个 <code>/dev/ANLOGIC-PCI0_frame</code> 节点，最多**两槽**（槽 0=A、槽 1=B）；
+> <code>--source device-pair</code> 自己写 pair 寄存器、一次 <code>ARM_PAIR/ACK_PAIR</code> 取同一曝光对。
+> 4K 全帧未上板验证；板端帧率数字都是 1080p ROI 口径，4K 只有 x86 本地基准（见「4K 单路」）。
 
 ## 快速开始
 
@@ -39,21 +39,20 @@ curl       http://<板子IP>:8091/stats
 
 ## 数据链路（当前）
 
-~~~text
-IMX415 A/B 4K RAW10
-  -> checked CSI-2（ECC/VC/DT/WC/CRC/行数/FS-FE 裁决）
-  -> 偶数 ROI 1920x1080（X0=960, Y0=540, SKIP_ROWS=37）
-  -> cam_r10f_writer（128B 头 + packed RAW10 + 4KiB 尾零）
-  -> DDR3 双缓冲 -> ddr_frame_pusher
-  -> PCIe Gen2 x2 Posted MWr -> 主机一致性 DMA 槽
-  -> /dev/ANLOGIC-PCI0_frame（两槽：0=A，1=B；pair 门铃 +32/+36）
-  -> display --source device-pair：ARM_PAIR -> 等两门铃 -> 两槽 strict
-  -> A/B 各自 R10F 解析 -> 5B/4px 解包 -> 去马赛克/后处理 -> JPEG
-  -> /stream_a.mjpg + /stream_b.mjpg + /pair（并排页面）
+~~~mermaid
+flowchart LR
+  CAM["IMX415 4K RAW10"] --> CSI["checked CSI-2<br/>ECC/VC/DT/WC/CRC/行数/FS-FE"]
+  CSI --> W["cam_r10f_writer<br/>128B 头 + packed RAW10 + 4KiB 尾零"]
+  W --> DDR[("DDR3 双缓冲")] --> P["ddr_frame_pusher"]
+  P -->|"PCIe Gen2 x2 Posted MWr"| SLOT["主机 DMA 槽（0=A，1=B；门铃 +32/+36）"]
+  SLOT --> SRC["display --source device-pair<br/>ARM_PAIR → 两门铃 → 两槽 strict"]
+  SRC --> DEC["R10F 解析 → 5B/4px 解包 → 去马赛克/后处理"]
+  DEC --> JPG["JPEG"] --> OUT["/stream_a.mjpg、/stream_b.mjpg、/pair"]
 ~~~
 
-槽内布局：16 B 槽头 + 112 B pad + R10F（128 B 头 + 2,592,000 B packed + 640 B 尾零）。
-槽步长 2,596,864 B；两槽 + mailbox 总分配 5,197,824 B。
+槽内布局：16 B 槽头 + 112 B pad + R10F（128 B 头 + 10,368,000 B packed + 2,944 B 尾零）。
+槽步长 10,375,168 B；单槽 + mailbox 页共 10,379,264 B，两槽共 20,754,432 B。
+单路 4K 用 <code>frame_slots=1</code> 即可。
 
 ## R10F 支持（2026-10-28 修复）
 
@@ -125,11 +124,65 @@ display-stream --source r10f --r10f fb.dma --bayer bggr --auto
 或做按区域/语义的白平衡。这是当前像素的事实，不是相位错。真要验证请拿已知色卡/
 已知颜色物体重拍。
 
-## RKNN YOLO11n 检测与叠加（2026-10-28）
+## 4K 单路：自动 CFA binning（2026-10-29）
+
+源帧超过 **4.0 Mpx** 时，<code>--scale</code> 的默认值 1 表示**自动**：先在 Bayer 域
+做 2×2 CFA binning 得到 1920×1080 RGB，再走原来的后处理 / NV12 / JPEG。1080p 及以下
+仍是 <code>factor = 1</code>（全分辨率去马赛克），路径与数字都不变。规则只有一条
+（<code>src/scale.rs::effective_factor</code>，灰度与彩色共用）：
+
+~~~text
+factor = requested(--scale N, N>1) ? N : (w*h > 4,000,000 ? 2 : 1)
+~~~
+
+- **CFA binning**（<code>src/bayer.rs::bin_rgb</code>）在 2×2 块里**按通道各自累加**：
+  R 1 个、G 2 个、B 1 个，各除以自己的采样数。不是把 4 个 Bayer 采样当灰度平均
+  （那会把绿和红/蓝混在一起），也不是先去马赛克再缩 RGB —— 整条 24.9 MB 的全分辨率
+  RGB 中间缓冲都不存在，只有一次 8.3 MB 遍历。
+- 归一化用移位代替除法（<code>--scale 2/4/8</code> 下每通道采样数都是 2 的幂），结果与
+  除法逐字节一致。单测：已知 4×4 / 16×16 图案下，binning 与「全分辨率去马赛克再 2×2
+  平均」的色差 ≤ 2 级（4×4 首箱还与手算值逐字节比对）。
+- 4K 源没有“强制全尺寸”开关：<code>--scale 1</code> 在 4K 上也是自动 binning
+  （全尺寸 4K 预览会卡死页面）。<code>--scale 4</code> → 960×540 仍可用，4K 灰度源
+  同样自动盒式缩到 1920×1080。
+
+### 本地基准（x86，相对值）
+
+<code>cargo test --release bench_4k -- --ignored --nocapture</code>。合成 R10F 帧
+（3840×2160、stride 4800、packed RAW10、整帧 10,371,072 B），Bayer 噪声图，单线程，
+软件 JPEG（板上走 VEPU121）。数字来自一次运行，不同机器/不同次有几 % 抖动：
+
+| 阶段 (ms) | 1080p 默认 | 4K 全尺寸 | 4K 2×2 binning |
+|---|---:|---:|---:|
+| R10F 解析 + 解包 | 0.47 | 1.89 | 1.83 |
+| 去马赛克 / CFA binning | 3.72 | 15.44 | 6.28 |
+| 后处理（黑/gamma/AE/AWB） | 4.74 | 16.78 | 4.47 |
+| RGB→NV12 | 4.31 | 17.48 | 4.28 |
+| JPEG（软件，质量 80） | 14.27 | 58.31 | 14.36 |
+| **合计** | **27.51** | **109.90** | **31.22** |
+| 输出尺寸 | 1920×1080 | 3840×2160 | 1920×1080 |
+| 估算单路 fps | 36.3 | 9.1 | 32.0 |
+| JPEG 字节数 | 274,250 | 1,088,161 | 252,100 |
+
+同一台机器上，4K 全尺寸是 binning 的 **3.5×**；binning 路径只比 1080p 默认路径贵
+**1.13×**。多出来的只是 4K 解析和一次 binning 遍历 —— 后处理 / NV12 / JPEG 三段与
+1080p **完全同尺寸同代码**。
+
+按板上已实测的 1080p 分段（去马赛克 26 + 后处理 21 + NV12 13 + 硬编码 21 ≈ 81 ms/帧），
+4K binning 把其中的 26 ms 全分辨率去马赛克换成一次 8.3 MB 遍历（同类
+<code>box_gray</code> 4K→1080p 的板端实测约 5 ms），单帧开销与 1080p 单帧同量级，
+**预计 ≥10 fps 有余量；4K 单路尚未上板复测**。上板后用
+<code>DISPLAY_DEBUG_TIMING=1</code> 看每帧分段（单路与双路都会打）。
+
+<code>encode_frame(4K, --scale 1)</code> 的端到端断言在同一支 bench 里：4K 帧必须
+返回 1920×1080。
+
+## RKNN YOLO11n 检测与叠加
 
 RK3588 三核 NPU 上跑 YOLO11n（COCO 80 类，640×640），检测框/类别/置信度直接画进
-MJPEG 和快照。A/B 各一个 RKNN context，默认 A=core0、B=core1；检测 worker 与
-JPEG 编码解耦，检测跟不上时覆盖旧任务，不阻塞推流。
+MJPEG 和快照。A/B 各一个 RKNN context（A=core0、B=core1），检测 worker 与 JPEG 编码解耦，
+跟不上时覆盖旧任务、不阻塞推流。模型契约、量化取舍与线程模型见
+[../docs/RKNN.md](../docs/RKNN.md)。
 
 ~~~sh
 # 单次离线验证（不占用设备）
@@ -145,10 +198,9 @@ JPEG 编码解耦，检测跟不上时覆盖旧任务，不阻塞推流。
 ... --detect --no-overlay
 ~~~
 
-模型是 **双输出** <code>boxes [1,4,8400] + scores [1,80,8400]</code>，分开量化。
-不要把 Ultralytics 默认的 <code>[1,84,8400]</code> 单输出直接做 int8：框坐标 0..640
-的尺度会把 0..1 的类别分数压成 0，框在但永远检测不到目标。模型来源、校验和与
-重新生成方法见 <code>models/README.md</code>。
+模型必须是**双输出** <code>boxes [1,4,8400] + scores [1,80,8400]</code>（分开量化）；
+单输出 <code>[1,84,8400]</code> 做 int8 会把类别分数压成 0。模型来源与校验和见
+<code>models/README.md</code>。
 
 板测（2026-10-28，960×544，双路）：
 
@@ -202,7 +254,8 @@ Vite 会把 <code>/stats</code>、<code>/stream</code>、<code>/snapshot</code> 
 --quality <1..100>                   JPEG 质量，默认 80
 --jpeg-dev <节点>                    硬件 JPEG 编码节点，默认 /dev/video4（存在即启用）
 --no-hw-jpeg                         只用软件编码（对比/排查用）
---scale <1|2|4|8>                    编码前降采样；彩色走 CFA binning
+--scale <1|2|4|8>                    编码前降采样 1/N；默认 1 = 自动（≤4.0 Mpx 不缩，
+                                     4K 自动 2×2）；彩色走 CFA binning，灰度走盒式均值
 --bayer <auto|gray|rggb|bggr|grbg|gbrg>  相位，默认 auto（当前 RGGB）
 --auto / --black / --gamma / --ae / --awb / --no-awb  后处理
 --port <端口>                        默认 8090
@@ -221,13 +274,13 @@ Vite 会把 <code>/stats</code>、<code>/stream</code>、<code>/snapshot</code> 
 
 ![web console](docs/web-console.jpg)
 
-> 截图是 <code>--source synthetic</code> 的测试画面；板上是 A/B 实时图像。
+> 截图是 RK3588 板上 <code>--source device-pair</code> 的 A/B 实拍，双路 SEQ 一致。
 
 <code>/</code> 和 <code>/pair</code> 现在是同一套监控上位机（Vue 3 + Vite，单文件构建）：
 
 - 深色仪表盘：双路画面、通道状态、分辨率 / SEQ / 实时 fps；
 - 布局切换（双路 / 仅 A / 仅 B）、单帧抓拍下载、画面全屏；
-- 右侧链路状态、帧率曲线（A/B 各 60 个 1 s 采样）、会话计数；
+- 画面下方遥测台：链路状态、A/B 帧率曲线（各 60 个 1 s 采样）、会话计数、快捷操作；
 - 单路模式自动隐藏 B 路并禁用相关按钮，不需要两套页面；
 - 快捷键：<code>1/2/3</code> 切布局，<code>F</code> 全屏，<code>S</code> 抓拍；
 - 断流自动重连（1.5 s 退避），MJPEG 首帧用 <code>naturalWidth</code> 探测，
@@ -257,7 +310,8 @@ Vite 会把 <code>/stats</code>、<code>/stream</code>、<code>/snapshot</code> 
 src/driver.rs        驱动 ABI：ioctl/结构体/mmap/槽读取
 src/r10f.rs          R10F 头校验 + packed RAW10 解包
 src/source/          synthetic / pgm / r10f_file / device / pair
-src/bayer.rs         相位枚举 + 双线性去马赛克 + CFA binning
+src/bayer.rs         相位枚举 + 双线性去马赛克 + CFA binning（移位归一化）
+src/bench4k.rs       4K 单路本地基准（#[ignore]，用 --release 跑）
 src/auto.rs          黑电平 / 灰世界 AWB / AE / gamma / 高光去饱和 / 抖动
 src/encode.rs        JPEG（灰度 Luma / 彩色 RGB，软件回退）
 src/hwjpeg.rs        RK3588 VEPU121 硬件 JPEG（V4L2 M2M，NV12 → JPEG）
@@ -296,6 +350,8 @@ web/                 Vue 3 + Vite 上位机；dist/index.html 由 http.rs 嵌入
 - 实测（RK3588）：源端 30 pair/s；纯取帧上限约 **30 pair/s**（60 帧/s，PCIe ~155 MB/s）。
 - 1080p 彩色：约 **11 pair/s**（每对 ~90 ms：去马赛克 26 + 后处理 21 + RGB→NV12 13 + 硬编码 21）。
 - `--scale 2`（960×540）：约 **23~24 pair/s**（每对 ~43 ms），适合实时预览。
+- 4K 单路（源 3840×2160）：默认自动 2×2 CFA binning → 1920×1080，下游与 1080p 同尺寸；
+  x86 基准 31.22 ms/帧（全尺寸 4K 是 109.90 ms/帧，3.5×）。**未上板复测。**
 - 帧率瓶颈在 CPU 像素处理，不在 PCIe 也不在相机；<code>DISPLAY_DEBUG_TIMING=1</code> 每 5 秒打一行分段耗时。
 - 没有 CCM/镜头校正/3A 标定；颜色是“白参考 + 灰世界”级别，不是色彩管理级。
 - 只取 RAW10 高 8 位，暗部有量化损失；需要 10/16bit 通路要另改 Frame 类型。

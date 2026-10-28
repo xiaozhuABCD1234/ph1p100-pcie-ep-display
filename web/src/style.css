@@ -241,10 +241,21 @@ dd.mono {
 }
 
 .stage {
+  --pane-max: 100%;
   display: flex;
   flex-direction: column;
   gap: 12px;
   min-width: 0;
+}
+
+/* 单路/双路画面按视口高度收缩，避免遥测台被挤出屏幕。 */
+.stage[data-layout="a"],
+.stage[data-layout="b"] {
+  --pane-max: min(1040px, calc((100vh - 460px) * 16 / 9));
+}
+
+.stage[data-layout="pair"] {
+  --pane-max: min(100%, calc((100vh - 460px) * 32 / 9 + 14px));
 }
 
 .stage-head {
@@ -252,6 +263,9 @@ dd.mono {
   align-items: flex-end;
   justify-content: space-between;
   gap: 14px;
+  width: 100%;
+  max-width: var(--pane-max);
+  margin-inline: auto;
   padding: 0 2px;
 }
 
@@ -355,14 +369,14 @@ dd.mono {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+  width: 100%;
+  max-width: var(--pane-max);
+  margin-inline: auto;
 }
 
 .stage-grid[data-layout="a"],
 .stage-grid[data-layout="b"] {
   grid-template-columns: minmax(0, 1fr);
-  width: 100%;
-  max-width: 1040px;
-  margin: 0 auto;
 }
 
 /* ---------- camera pane ---------- */
@@ -686,6 +700,9 @@ dd.mono {
   display: flex;
   align-items: center;
   gap: 16px;
+  width: 100%;
+  max-width: var(--pane-max);
+  margin-inline: auto;
   padding: 2px 2px 0;
   color: var(--muted);
   font-size: 10px;
@@ -735,7 +752,7 @@ dd.mono {
   grid-template-columns: 1.1fr 1.35fr 1fr 1.05fr;
   gap: 12px;
   flex: 1;
-  min-height: 210px;
+  min-height: 190px;
   min-width: 0;
 }
 
@@ -757,10 +774,12 @@ dd.mono {
   min-height: 0;
 }
 
+/* height:0 + flex-grow 让曲线只在卡片确实有富余高度时拉伸；
+   height:auto 会退到 canvas 的 150px 固有高度，把整页撑出屏幕。 */
 .deck .rate .sparkline {
-  flex: 1;
-  height: auto;
-  min-height: 42px;
+  flex: 1 1 0;
+  height: 0;
+  min-height: 38px;
 }
 
 .deck .card.actions {

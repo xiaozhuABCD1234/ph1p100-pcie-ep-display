@@ -254,6 +254,17 @@ pub fn bin_rgb(
     for &c in quad.iter() {
         count[c as usize] += mul;
     }
+    // 归一化用移位：--scale 允许的 2/4/8 下 count 全是 2 的幂（(f/2)² × 1:2:1），
+    // ARM 上整数除法比移位贵一个量级，而这是 4K 预览每帧固定要跑的一遍。
+    // 其它偶数因子（比如 6）count 不是 2 的幂时才退回除法。
+    let mut shift = [0u32; N_CH];
+    let mut half = [0u32; N_CH];
+    let mut pow2 = true;
+    for c in 0..N_CH {
+        shift[c] = count[c].trailing_zeros();
+        half[c] = count[c] / 2;
+        pow2 &= count[c].is_power_of_two();
+    }
 
     let mut out = vec![0u8; ow * oh * N_CH];
     let mut acc = vec![0u32; ow * N_CH];
@@ -281,9 +292,18 @@ pub fn bin_rgb(
             }
         }
         let orow = &mut out[oy * ow * N_CH..(oy + 1) * ow * N_CH];
-        for (o, a) in orow.chunks_exact_mut(N_CH).zip(acc.chunks_exact(N_CH)) {
-            for c in 0..N_CH {
-                o[c] = ((a[c] + count[c] / 2) / count[c]) as u8;
+        if pow2 {
+            for (o, a) in orow.chunks_exact_mut(N_CH).zip(acc.chunks_exact(N_CH)) {
+                for c in 0..N_CH {
+                    // (a + count/2) / count，count = 1 << shift：逐位等价，只是更快
+                    o[c] = ((a[c] + half[c]) >> shift[c]) as u8;
+                }
+            }
+        } else {
+            for (o, a) in orow.chunks_exact_mut(N_CH).zip(acc.chunks_exact(N_CH)) {
+                for c in 0..N_CH {
+                    o[c] = ((a[c] + count[c] / 2) / count[c]) as u8;
+                }
             }
         }
     }
@@ -513,6 +533,120 @@ mod tests {
         assert_eq!(demosaic(&[9], 1, 1, BayerPhase::Rggb).unwrap().len(), 3);
     }
 
+    /// 缓变的三通道渐变（每像素 1~2 级）：双线性插值对一次函数是精确的，
+    /// 所以去马赛克在内部像素能还原原值；2×2 binning 取的是块内同色站点，
+    /// 与 2×2 盒均值只差半个像素的台阶（≤2 级）。
+    fn ramp_rgb(width: usize, height: usize) -> Vec<u8> {
+        let mut rgb = vec![0u8; width * height * N_CH];
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) * N_CH;
+                rgb[i] = (40 + 2 * x) as u8;
+                rgb[i + 1] = (100 + y) as u8;
+                rgb[i + 2] = (180 - x - y) as u8;
+            }
+        }
+        rgb
+    }
+
+    /// 把 4×4 原始 Bayer 镜像外扩成 8×8（四周各 2 像素 = 偶数，2×2 相位不变），
+    /// 再去马赛克 + 2×2 盒式缩，取覆盖原图的那 2×2 个箱作为参考。
+    ///
+    /// 外扩是为了让参考像素避开双线性的帧边界夹取：4×4 直接跑去马赛克时，
+    /// 边界会把本像素当邻居、读到别的滤色片，最大差能到 35 级以上 —— 那是参考
+    /// 实现的边界处理，不是 binning 的色差。镜像外扩保持相位，参考就全是内部像素。
+    fn padded_reference_4x4(raw4: &[u8], phase: BayerPhase) -> Vec<u8> {
+        fn mirror(i: isize) -> usize {
+            if i < 0 {
+                (-i) as usize
+            } else if i > 3 {
+                (6 - i) as usize
+            } else {
+                i as usize
+            }
+        }
+        let mut raw8 = vec![0u8; 8 * 8];
+        for y in 0..8 {
+            for x in 0..8 {
+                raw8[y * 8 + x] = raw4[mirror(y as isize - 2) * 4 + mirror(x as isize - 2)];
+            }
+        }
+        let full = demosaic(&raw8, 8, 8, phase).unwrap();
+        let boxed = crate::scale::box_rgb(&full, 8, 8, 2);
+        let mut out = Vec::with_capacity(4 * N_CH);
+        for by in 0..2 {
+            for bx in 0..2 {
+                let src = ((by + 1) * 4 + (bx + 1)) * N_CH;
+                out.extend_from_slice(&boxed[src..src + N_CH]);
+            }
+        }
+        out
+    }
+
+    /// 4×4 已知图案：binning 与「全分辨率双线性去马赛克再 2×2 盒式平均」的
+    /// 色差 ≤ 2 级（实测 1 级），四种相位都成立；首块再对一次手算值，
+    /// 证明每个通道只加自己那一格、不混别的滤色片。
+    ///
+    /// 4×4 输入只有 2×2 输出，每个输出像素都贴着帧边界，因此参考必须在
+    /// 「4×4 是某张更大图的一部分」的前提下算（见 `padded_reference_4x4`）；
+    /// 直接对 4×4 跑去马赛克再平均，最大差是 35 级以上，那是边界夹取误差。
+    #[test]
+    fn binning_matches_demosaic_then_box_on_known_4x4() {
+        let src = ramp_rgb(4, 4);
+        for phase in [
+            BayerPhase::Rggb,
+            BayerPhase::Bggr,
+            BayerPhase::Grbg,
+            BayerPhase::Gbrg,
+        ] {
+            let raw = mosaic(&src, 4, 4, phase.quad().unwrap());
+            let binned = bin_rgb(&raw, 4, 4, 2, phase).unwrap();
+            let reference = padded_reference_4x4(&raw, phase);
+            assert_eq!(binned.len(), reference.len());
+            for (i, (&got, &want)) in binned.iter().zip(reference.iter()).enumerate() {
+                let d = (got as i32 - want as i32).abs();
+                assert!(d <= 2, "{phase:?} 输出第 {i} 个字节色差 {d} > 2");
+            }
+        }
+        // RGGB 首箱手算：R(0,0)=40；G=(G(0,1)+G(1,0))/2=(101+100+1)/2=101；
+        // B(1,1)=180-1-1=178
+        let raw = mosaic(&src, 4, 4, BayerPhase::Rggb.quad().unwrap());
+        let binned = bin_rgb(&raw, 4, 4, 2, BayerPhase::Rggb).unwrap();
+        assert_eq!(&binned[..N_CH], &[40, 101, 178], "首箱必须是手算的同色均值");
+    }
+
+    /// 16×16 渐变：binning 与「全分辨率去马赛克再 2×2 平均」在内部像素上的
+    /// 最大色差 ≤ 2 级（实测 1 级，只来自四舍五入），四种相位都要成立。
+    ///
+    /// 只比内部：帧边界那一圈是双线性去马赛克的夹取误差（与 binning 无关），
+    /// 16×16 输入才留得出 1 圈内部（输出 8×8 → 内部 6×6）。
+    #[test]
+    fn binning_matches_demosaic_then_box_on_gradient() {
+        let (w, h) = (16usize, 16usize);
+        let src = ramp_rgb(w, h);
+        let (ow, oh) = (w / 2, h / 2);
+        for phase in [
+            BayerPhase::Rggb,
+            BayerPhase::Bggr,
+            BayerPhase::Grbg,
+            BayerPhase::Gbrg,
+        ] {
+            let raw = mosaic(&src, w, h, phase.quad().unwrap());
+            let binned = bin_rgb(&raw, w, h, 2, phase).unwrap();
+            let full = demosaic(&raw, w, h, phase).unwrap();
+            let boxed = crate::scale::box_rgb(&full, w, h, 2);
+            for oy in 1..oh - 1 {
+                for ox in 1..ow - 1 {
+                    for c in 0..3 {
+                        let i = (oy * ow + ox) * 3 + c;
+                        let d = (binned[i] as i32 - boxed[i] as i32).abs();
+                        assert!(d <= 2, "{phase:?} 在输出 ({ox},{oy}) 通道 {c} 色差 {d} > 2");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn bin_rgb_2x2_is_true_binning() {
         // gbrg 的 2×2 单元：G B / R G
@@ -530,6 +664,55 @@ mod tests {
         let raw = vec![7u8; 16];
         let got = bin_rgb(&raw, 4, 4, 4, BayerPhase::Rggb).unwrap();
         assert_eq!((got.len(), got[0], got[1], got[2]), (3, 7, 7, 7));
+    }
+
+    #[test]
+    fn bin_rgb_shift_normalisation_matches_division() {
+        // 移位是 std 优化，结果必须与「(sum + count/2) / count」逐字节一致：
+        // 用 6 这种 count 不是 2 的幂的因子走除法分支，2/4/8 走移位分支，两者都要对。
+        let mut seed = 0x5eed_1234u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (seed >> 17) as u8
+        };
+        let (w, h) = (24usize, 16usize);
+        let raw: Vec<u8> = (0..w * h).map(|_| rnd()).collect();
+        for factor in [2usize, 4, 8] {
+            for phase in [
+                BayerPhase::Rggb,
+                BayerPhase::Bggr,
+                BayerPhase::Grbg,
+                BayerPhase::Gbrg,
+            ] {
+                let quad = phase.quad().unwrap();
+                let got = bin_rgb(&raw, w, h, factor, phase).unwrap();
+                let (ow, oh) = (w / factor, h / factor);
+                let mul = ((factor / 2) * (factor / 2)) as u32;
+                let mut count = [0u32; N_CH];
+                for &c in quad.iter() {
+                    count[c as usize] += mul;
+                }
+                let mut want = vec![0u8; ow * oh * N_CH];
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let mut sum = [0u32; N_CH];
+                        for dy in 0..factor {
+                            for dx in 0..factor {
+                                let x = ox * factor + dx;
+                                let y = oy * factor + dy;
+                                let c = quad[(y & 1) * 2 + (x & 1)] as usize;
+                                sum[c] += raw[y * w + x] as u32;
+                            }
+                        }
+                        for c in 0..N_CH {
+                            want[(oy * ow + ox) * N_CH + c] =
+                                ((sum[c] + count[c] / 2) / count[c]) as u8;
+                        }
+                    }
+                }
+                assert_eq!(got, want, "factor {factor} {phase:?}");
+            }
+        }
     }
 
     #[test]

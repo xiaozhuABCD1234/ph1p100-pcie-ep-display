@@ -211,7 +211,7 @@ onBeforeUnmount(() => {
     </header>
 
     <main class="main">
-      <section class="stage">
+      <section class="stage" :data-layout="layout">
         <div class="stage-head">
           <div class="stage-title">
             <p class="eyebrow">REALTIME PREVIEW</p>
@@ -290,14 +290,14 @@ onBeforeUnmount(() => {
               <span class="ch ch-a">A</span>
               <span class="rate-num">{{ fpsA.toFixed(1) }}<small>fps</small></span>
             </div>
-            <Sparkline :values="histA" color="#35e0d0" />
+            <Sparkline :values="histA" color="#35e0d0" :max="40" />
           </div>
           <div v-if="stats.pair" class="rate">
             <div class="rate-head">
               <span class="ch ch-b">B</span>
               <span class="rate-num">{{ fpsB.toFixed(1) }}<small>fps</small></span>
             </div>
-            <Sparkline :values="histB" color="#7c8cff" />
+            <Sparkline :values="histB" color="#7c8cff" :max="40" />
           </div>
           <p v-else class="rate-empty">B 路未启用 · 用 --source device-pair 启动</p>
         </section>
