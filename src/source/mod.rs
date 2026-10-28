@@ -5,6 +5,7 @@
 
 pub mod device;
 pub mod pgm;
+pub mod r10f_file;
 pub mod synthetic;
 
 use std::io;
@@ -19,6 +20,9 @@ pub struct Frame {
     pub width: u16,
     pub height: u16,
     pub gray: Vec<u8>,
+    /// R10F 头 0x0A 的 camera_id（0=A，1=B）；PGM/合成源为 None。
+    /// `--bayer auto` 用它选 A=RGGB、B=BGGR。
+    pub camera_id: Option<u8>,
 }
 
 impl Frame {
@@ -28,7 +32,13 @@ impl Frame {
             width,
             height,
             gray,
+            camera_id: None,
         }
+    }
+
+    pub fn with_camera(mut self, camera_id: u8) -> Self {
+        self.camera_id = Some(camera_id);
+        self
     }
 }
 

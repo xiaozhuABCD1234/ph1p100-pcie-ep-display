@@ -3,6 +3,7 @@
 
 use super::{Frame, FrameSource, SourceError, MAX_FRAME_BYTES};
 use crate::driver::{FrameDevice, SlotError};
+use crate::r10f;
 use std::path::Path;
 
 pub struct DeviceSource {
@@ -11,9 +12,12 @@ pub struct DeviceSource {
     last_seq: u32,
     /// 等帧超时（毫秒）
     timeout_ms: u32,
-    gray: Vec<u8>,
+    /// 一槽原始内容（R10F 或旧 8 bit 像素），长度 = 驱动报的 slot_bytes
+    slot: Vec<u8>,
     /// 因槽头不一致（写完前被读到等）跳过的帧数，只用于告警
     skipped: u64,
+    /// R10F 头 0x28 只打印一次；当前 RTL 写的是占位值，不是实测相位
+    warned_phase: bool,
 }
 
 impl DeviceSource {
@@ -31,20 +35,21 @@ impl DeviceSource {
                 ),
             ));
         }
-        let gray = vec![0u8; bytes];
+        let slot = vec![0u8; bytes];
         // ioctl 报的 seq/count：0 表示 FPGA 还没往这块缓冲写过帧（空转是正常状态）
         let i = dev.info();
         eprintln!(
-            "收帧缓冲就绪：{}x{} 灰度，{} 槽；ioctl 报的 seq={} count={}",
-            i.width, i.height, i.slots, i.seq, i.count
+            "收帧缓冲就绪：{}x{}，{} 槽，槽内容 {} 字节（R10F 时是 128B 头 + packed RAW10）；ioctl 报的 seq={} count={}",
+            i.width, i.height, i.slots, i.slot_bytes, i.seq, i.count
         );
         Ok(DeviceSource {
             dev,
             // 0 = 缓冲里已经有帧就先取最新的那帧，不干等下一帧
             last_seq: 0,
             timeout_ms,
-            gray,
+            slot,
             skipped: 0,
+            warned_phase: false,
         })
     }
 }
@@ -60,7 +65,7 @@ impl FrameSource for DeviceSource {
                     self.timeout_ms, w.seq, self.last_seq, w.count
                 )));
             }
-            match self.dev.read_slot(w.slot, w.seq, &mut self.gray) {
+            match self.dev.read_slot(w.slot, w.seq, &mut self.slot) {
                 Ok(read) => {
                     self.last_seq = w.seq;
                     if read.copied < self.info_bytes() {
@@ -74,12 +79,51 @@ impl FrameSource for DeviceSource {
                             self.info_bytes()
                         );
                     }
-                    let info = self.dev.info();
-                    return Ok(Frame::new(
-                        info.width as u16,
-                        info.height as u16,
-                        self.gray.clone(),
-                    ));
+                    let content = &self.slot[..read.copied];
+                    match r10f::parse(content) {
+                        Ok(Some(f)) => {
+                            let info = self.dev.info();
+                            if f.width != info.width as usize || f.height != info.height as usize {
+                                eprintln!(
+                                    "!! R10F 几何 {}x{} 与驱动报的 {}x{} 不一致，跳过这一帧",
+                                    f.width, f.height, info.width, info.height
+                                );
+                                continue;
+                            }
+                            if !self.warned_phase {
+                                self.warned_phase = true;
+                                eprintln!(
+                                    "R10F：{}x{} stride={} camera_id={}，头 0x28 声明 phase={}（当前 RTL 为占位值，不可信；当前安装 A/B 均 RGGB）",
+                                    f.width, f.height, f.stride, f.camera_id, f.header_phase
+                                );
+                            }
+                            return Ok(Frame::new(f.width as u16, f.height as u16, f.raw)
+                                .with_camera(f.camera_id));
+                        }
+                        Ok(None) => {
+                            // 旧 8 bit 灰度槽：整槽就是像素，按驱动几何取前 width*height 字节
+                            let info = self.dev.info();
+                            let n = info.width as usize * info.height as usize;
+                            if content.len() < n {
+                                eprintln!(
+                                    "!! 旧 8bit 槽只有 {} 字节，不够 {}x{}，跳过这一帧",
+                                    content.len(),
+                                    info.width,
+                                    info.height
+                                );
+                                continue;
+                            }
+                            return Ok(Frame::new(
+                                info.width as u16,
+                                info.height as u16,
+                                content[..n].to_vec(),
+                            ));
+                        }
+                        Err(why) => {
+                            eprintln!("!! R10F 解析失败：{why}（跳过这一帧，不猜）");
+                            continue;
+                        }
+                    }
                 }
                 Err(SlotError::Inconsistent(why)) => {
                     self.skipped += 1;

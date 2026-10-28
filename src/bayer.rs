@@ -26,6 +26,9 @@ pub enum BayerPhase {
     Grbg,
     /// 第一行 G B、第二行 G R
     Gbrg,
+    /// 按 R10F 头 camera_id 选：A(0)=RGGB、B(1)=BGGR（当前机械安装）。
+    /// 仅供 `encode_frame` 在拿到帧元数据后解析；`quad()` 不直接支持。
+    Auto,
 }
 
 /// 通道编号：0=红 1=绿 2=蓝
@@ -40,6 +43,7 @@ impl BayerPhase {
             "bggr" => Some(BayerPhase::Bggr),
             "grbg" => Some(BayerPhase::Grbg),
             "gbrg" => Some(BayerPhase::Gbrg),
+            "auto" => Some(BayerPhase::Auto),
             _ => None,
         }
     }
@@ -52,6 +56,18 @@ impl BayerPhase {
             BayerPhase::Bggr => "bggr",
             BayerPhase::Grbg => "grbg",
             BayerPhase::Gbrg => "gbrg",
+            BayerPhase::Auto => "auto",
+        }
+    }
+
+    /// 把 `auto` 解析成具体相位。当前机械安装：A 路 180° 与 B 相反，
+    /// 两块模组都正装，A/B 均为 RGGB；R10F 头 0x28 的 3(GBRG) 是占位值，不能用。
+    /// 同一办公室告示牌在 A/B 上都还原成黄色，而 BGGR 会把它们都变蓝。
+    pub fn resolve(self, camera_id: Option<u8>) -> BayerPhase {
+        let _ = camera_id;
+        match self {
+            BayerPhase::Auto => BayerPhase::Rggb,
+            other => other,
         }
     }
 
@@ -69,6 +85,7 @@ impl BayerPhase {
             BayerPhase::Bggr => Some([2, 1, 1, 0]),
             BayerPhase::Grbg => Some([1, 0, 2, 1]),
             BayerPhase::Gbrg => Some([1, 2, 0, 1]),
+            BayerPhase::Auto => None,
         }
     }
 }
@@ -272,6 +289,7 @@ mod tests {
         assert_eq!(BayerPhase::parse("bggr"), Some(BayerPhase::Bggr));
         assert_eq!(BayerPhase::parse("grbg"), Some(BayerPhase::Grbg));
         assert_eq!(BayerPhase::parse("Gbrg"), Some(BayerPhase::Gbrg));
+        assert_eq!(BayerPhase::parse("auto"), Some(BayerPhase::Auto));
         assert_eq!(BayerPhase::parse("rgbg"), None);
     }
 
@@ -283,6 +301,10 @@ mod tests {
         assert_eq!(BayerPhase::Grbg.quad(), Some([1, 0, 2, 1]));
         assert_eq!(BayerPhase::Gbrg.quad(), Some([1, 2, 0, 1]));
         assert_eq!(BayerPhase::Gray.quad(), None);
+        assert_eq!(BayerPhase::Auto.quad(), None);
+        assert_eq!(BayerPhase::Auto.resolve(Some(0)), BayerPhase::Rggb);
+        assert_eq!(BayerPhase::Auto.resolve(Some(1)), BayerPhase::Rggb);
+        assert_eq!(BayerPhase::Auto.resolve(None), BayerPhase::Rggb);
         // 四个相位里绿都占两格、红蓝各一格
         for p in [
             BayerPhase::Rggb,
@@ -416,7 +438,13 @@ mod tests {
         let raw = vec![1u8; 16];
         assert!(bin_rgb(&raw, 4, 4, 3, BayerPhase::Rggb).is_err());
         assert!(bin_rgb(&raw, 4, 4, 2, BayerPhase::Gray).is_err());
-        assert!(bin_rgb(&raw[..4], 4, 4, 2, BayerPhase::Rggb).is_err(), "数据不够应当报错");
-        assert!(bin_rgb(&raw, 2, 2, 4, BayerPhase::Rggb).is_err(), "缩到 0 维应当报错");
+        assert!(
+            bin_rgb(&raw[..4], 4, 4, 2, BayerPhase::Rggb).is_err(),
+            "数据不够应当报错"
+        );
+        assert!(
+            bin_rgb(&raw, 2, 2, 4, BayerPhase::Rggb).is_err(),
+            "缩到 0 维应当报错"
+        );
     }
 }

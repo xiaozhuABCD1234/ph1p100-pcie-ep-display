@@ -2,7 +2,7 @@
 //!
 //! 数据源三选一（`--source`）：合成源、PGM 文件源、驱动设备源。
 //! 帧缓存里是 Bayer 马赛克时用 `--bayer <相位>` 做去马赛克，输出彩色；
-//! `--bayer gray`（默认）保持原有的单分量灰度输出。
+//! `--bayer gray` 保持单分量灰度输出。默认 **bggr**，与本板实测 R10F 一致。
 //! 推流接口两个：MJPEG 连续流与单帧 JPEG 快照（见 `--help`）。
 
 mod auto;
@@ -10,6 +10,7 @@ mod bayer;
 mod driver;
 mod encode;
 mod http;
+mod r10f;
 mod scale;
 mod source;
 mod store;
@@ -36,22 +37,17 @@ const DEF_PORT: u16 = 8090;
 const DEF_FPS: u32 = 15;
 const DEF_QUALITY: u8 = 80;
 const DEF_WAIT_MS: u32 = 2000;
-/// Bayer 相位默认 `gray`：与旧版行为一致（单分量灰度），要彩色得显式指定相位。
+/// Bayer 相位默认 **`auto`**：当前安装 A/B 均为 RGGB。
 ///
-/// 实测相位是 **`gbrg`**（次选 `grbg`，两者逐像素只差红蓝互换）—— 注意这与本仓库
-/// 早期 README 的 `bggr`、以及上一版注释里的 `grbg` 都不同，那两次都是错的：
-/// 早期用的是「假彩色能量最低」（选错相位会把通道模糊掉、反而让高频能量变低，
-/// 指标偏向错误答案）；上一版用的是「2×2 四格原始均值 + 典型 CMOS 响应绿>红>蓝」，
-/// 那一步只定对了「绿在主对角线」（→ 只能是 `grbg`/`gbrg`），但红蓝谁上谁下是靠
-/// 「反对角均值较大的那个是红」推的，而**幅值根本区分不了 `grbg`/`gbrg`**
-/// （两者逐像素只差 R/B 互换），那一步前提不成立。
-/// 现在定死的方法：让画面里出现已知颜色的物体（白海报/白屏/黄机柜）两相位各拍一张，
-/// 「白纸仍旧白、黄柜仍旧黄」的那个才是对的 → **`gbrg`**（证据见 display/README.md）。
-///
-/// 另外：**相机物理转向不需要换相位** —— CFA 长在传感器上、读出顺序固定，转相机只是
-/// 画面内容转了，帧里的马赛克排布没变。只有换相机模组/改 MIPI 走线/改 FPGA 侧像素
-/// 对齐（平移一个像素、镜像、转置）时才需要重新验。
-const DEF_BAYER: BayerPhase = BayerPhase::Gray;
+/// 已确证的部分（不要再从 R10F 头 0x28 抄相位）：
+///   * 真实帧 2×2 均值显示绿在**反对角** (0,1)/(1,0)（两条绿对角差 0.07%，
+///     主对角差 13.5%），所以只可能是 RGGB 或 BGGR；header 0x28=3(GBRG) 是
+///     `SRC_BAYER_PHASE=0` 占位按 ROI 奇偶推导的，必然错。
+///   * A/B 两路看同一间办公室：只有 RGGB 让两边告示牌都还原成黄色；BGGR 会把
+///     它们都变蓝。故当前两块模组都按 **RGGB**（早期 BGGR 结论来自翻转预览）。
+///   * 若换模组/改支架/改 FPGA 像素对齐，必须用已知色卡重测；
+///     `--bayer rggb|bggr` 可随时覆盖。
+const DEF_BAYER: BayerPhase = BayerPhase::Auto;
 /// `--auto` 预设的四个值：
 ///  * 黑电平 12 = IMX415 的 10bit black pedestal 50 截成 8 位（`50 >> 2`），板上实测；
 ///  * gamma 2.2 = 常规 sRGB 近似；
@@ -65,6 +61,7 @@ const DEF_AE: u8 = 100;
 enum SourceKind {
     Synthetic,
     Pgm,
+    R10f,
     Device,
 }
 
@@ -72,6 +69,7 @@ enum SourceKind {
 struct Config {
     kind: SourceKind,
     pgm: Option<PathBuf>,
+    r10f: Option<PathBuf>,
     device: PathBuf,
     width: u16,
     height: u16,
@@ -100,6 +98,7 @@ impl Default for Config {
         Config {
             kind: SourceKind::Synthetic,
             pgm: None,
+            r10f: None,
             device: PathBuf::from(DEF_DEV),
             width: 640,
             height: 480,
@@ -125,8 +124,9 @@ fn usage() -> String {
          \n\
          用法：display-stream [选项]\n\
          \n\
-         --source <synthetic|pgm|device>  数据源，默认 synthetic\n\
+         --source <synthetic|pgm|r10f|device>  数据源，默认 synthetic\n\
          --pgm <路径>                     文件源的 PGM（P5/P2 灰度图）\n\
+         --r10f <路径>                    R10F 文件源（.dma，从魔数起；离线回放）\n\
          --device <路径>                  设备源的收帧缓冲节点，默认 {DEF_DEV}\n\
          --width <像素>                   合成源宽度，默认 640\n\
          --height <像素>                  合成源高度，默认 480\n\
@@ -135,21 +135,24 @@ fn usage() -> String {
          --scale <1|2|4|8>               编码前降采样 1/N，默认 1（不缩）。灰度走盒式\n\
                                           均值；彩色走 CFA binning（2×2 块内 R/G/G/B\n\
                                           各一个采样，去马赛克与降采样一步完成）\n\
-         --bayer <gray|rggb|bggr|grbg|gbrg>  帧缓存里 Bayer 马赛克的相位，\n\
-                                          默认 {DEF_BAYER}（不去马赛克，单分量灰度）；\n\
+         --bayer <auto|gray|rggb|bggr|grbg|gbrg>  帧缓存里 Bayer 马赛克的相位，\n\
+                                          默认 {DEF_BAYER}：当前安装 A/B 均 RGGB；\n\
+                                          gray = 不去马赛克、单分量灰度；\n\
                                           非 gray 时按该相位双线性去马赛克，\n\
                                           输出三分量彩色 JPEG\n\
-                                          本板实测是 gbrg（次选 grbg），\n\
-                                          要彩色就写 --bayer gbrg\n\
+                                          注意：R10F 头 0x28 的 3(GBRG) 是占位值，\n\
+                                          不能直接拿来当相位\n\
          --auto                           一键打开后处理：黑电平 -{DEF_BLACK}、\n\
                                           gamma {DEF_GAMMA}、AE 目标 {DEF_AE}、白平衡开；\n\
+                                          默认：device/r10f 开，synthetic/pgm 关；\n\
                                           下面四项可以单独覆盖（与 --auto 的先后无关）\n\
          --black <0..64>                  黑电平（IMX415 的 10bit pedestal 50\n\
                                           截成 8 位就是 12），默认：--auto 时 {DEF_BLACK}，否则 0\n\
          --gamma <1.0..4.0>               gamma，默认：--auto 时 {DEF_GAMMA}，否则 1.0\n\
          --ae <0..250>                    AE 目标（gamma 编码后的中位数亮度），0 = 关；\n\
                                           默认：--auto 时 {DEF_AE}，否则 0\n\
-         --awb / --no-awb                 灰世界白平衡（只在彩色相位下有效），\n\
+         --awb / --no-awb                 白点白平衡（只在彩色相位下有效），\n\
+                                          取最亮且未过曝的像素作白参考；\n\
                                           默认：--auto 时开，否则关\n\
          --port <端口>                    监听端口，默认 {DEF_PORT}\n\
          --bind <地址>                    监听地址，默认 0.0.0.0\n\
@@ -172,8 +175,13 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut cfg = Config::default();
     let mut i = 0usize;
     // 后处理四项的“显式给过吗”：None = 跟着 --auto 的预设走
-    let (mut o_black, mut o_gamma, mut o_ae, mut o_awb) =
-        (None::<u8>, None::<f32>, None::<u8>, None::<bool>);
+    let (mut o_black, mut o_gamma, mut o_ae, mut o_awb, mut o_auto) = (
+        None::<u8>,
+        None::<f32>,
+        None::<u8>,
+        None::<bool>,
+        None::<bool>,
+    );
     // 取值辅助：拿下一个参数
     fn value(args: &[String], i: &mut usize, name: &str) -> Result<String, String> {
         *i += 1;
@@ -189,15 +197,17 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 cfg.kind = match v.as_str() {
                     "synthetic" => SourceKind::Synthetic,
                     "pgm" => SourceKind::Pgm,
+                    "r10f" => SourceKind::R10f,
                     "device" => SourceKind::Device,
                     other => {
                         return Err(format!(
-                            "--source 只认 synthetic/pgm/device，收到 '{other}'"
+                            "--source 只认 synthetic/pgm/r10f/device，收到 '{other}'"
                         ))
                     }
                 };
             }
             "--pgm" => cfg.pgm = Some(PathBuf::from(value(args, &mut i, &name)?)),
+            "--r10f" => cfg.r10f = Some(PathBuf::from(value(args, &mut i, &name)?)),
             "--device" => cfg.device = PathBuf::from(value(args, &mut i, &name)?),
             "--width" => cfg.width = num(&value(args, &mut i, &name)?, &name, 1, 65535)? as u16,
             "--height" => cfg.height = num(&value(args, &mut i, &name)?, &name, 1, 65535)? as u16,
@@ -218,8 +228,14 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             // 后处理：`--auto` 是预设，四个单项选项可以覆盖它（解析顺序无关，
             // 先在 Option 里记下“显式给过没有”，循环结束后再一次性解算）。
-            "--auto" => cfg.auto = true,
-            "--no-auto" => cfg.auto = false,
+            "--auto" => {
+                cfg.auto = true;
+                o_auto = Some(true);
+            }
+            "--no-auto" => {
+                cfg.auto = false;
+                o_auto = Some(false);
+            }
             "--black" => o_black = Some(num(&value(args, &mut i, &name)?, &name, 0, 64)? as u8),
             "--gamma" => o_gamma = Some(fnum(&value(args, &mut i, &name)?, &name, 1.0, 4.0)?),
             "--ae" => o_ae = Some(num(&value(args, &mut i, &name)?, &name, 0, 250)? as u8),
@@ -244,8 +260,13 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     if cfg.kind == SourceKind::Pgm && cfg.pgm.is_none() {
         return Err("--source pgm 必须配 --pgm <路径>".into());
     }
-    // 后处理解算：显式值优先，否则取 --auto 的预设（未开 --auto 就是恒等、原样透传）
-    let preset = cfg.auto;
+    if cfg.kind == SourceKind::R10f && cfg.r10f.is_none() {
+        return Err("--source r10f 必须配 --r10f <路径>".into());
+    }
+    // 后处理解算：--auto/--no-auto 显式优先；否则 device/r10f 默认开，
+    // synthetic/pgm 默认关（避免影响算法/灰度用例）。
+    let preset = o_auto.unwrap_or(matches!(cfg.kind, SourceKind::Device | SourceKind::R10f));
+    cfg.auto = preset;
     cfg.black = o_black.unwrap_or(if preset { DEF_BLACK } else { 0 });
     cfg.gamma = o_gamma.unwrap_or(if preset { DEF_GAMMA } else { 1.0 });
     cfg.ae_target = o_ae.unwrap_or(if preset { DEF_AE } else { 0 });
@@ -293,6 +314,12 @@ fn build_source(cfg: &Config) -> Result<Box<dyn FrameSource>, String> {
             let src = PgmFile::open(&path).map_err(|e| format!("打开 PGM 失败：{e}"))?;
             Ok(Box::new(src))
         }
+        SourceKind::R10f => {
+            let path = cfg.r10f.clone().expect("parse_args 已校验");
+            let src = source::r10f_file::R10fFile::open(&path)
+                .map_err(|e| format!("打开 R10F 失败：{e}"))?;
+            Ok(Box::new(src))
+        }
         SourceKind::Device => {
             let src = DeviceSource::open(&cfg.device, cfg.wait_ms)
                 .map_err(|e| format!("打开收帧缓冲节点 {} 失败：{e}", cfg.device.display()))?;
@@ -318,6 +345,8 @@ fn encode_frame(
     scale: u32,
     fx: &mut auto::AutoLevel,
 ) -> Result<(Vec<u8>, u16, u16), String> {
+    // auto 必须在拿到帧之后解析：A/B 两路的 R/B 顺序不同，R10F header 自己不可信。
+    let phase = phase.resolve(frame.camera_id);
     let (w, h) = (frame.width as usize, frame.height as usize);
     let factor = scale as usize;
 
@@ -335,8 +364,8 @@ fn encode_frame(
             None => &mut frame.gray,
         };
         fx.apply(buf, ow, 1);
-        let jpeg = encode::encode_gray(buf, ow as u16, oh as u16, quality)
-            .map_err(|e| e.to_string())?;
+        let jpeg =
+            encode::encode_gray(buf, ow as u16, oh as u16, quality).map_err(|e| e.to_string())?;
         return Ok((jpeg, ow as u16, oh as u16));
     }
 
@@ -345,8 +374,8 @@ fn encode_frame(
         None => (bayer::demosaic(&frame.gray, w, h, phase)?, w, h),
     };
     fx.apply(&mut rgb, ow, 3);
-    let jpeg = encode::encode_rgb(&rgb, ow as u16, oh as u16, quality)
-        .map_err(|e| e.to_string())?;
+    let jpeg =
+        encode::encode_rgb(&rgb, ow as u16, oh as u16, quality).map_err(|e| e.to_string())?;
     Ok((jpeg, ow as u16, oh as u16))
 }
 
@@ -520,7 +549,7 @@ fn main() -> ExitCode {
     if cfg.awb && cfg.bayer.is_gray() {
         println!(
             "  注意  ：--bayer gray 不做去马赛克，白平衡无从生效；\
-             要彩色请给相位（本板实测 --bayer gbrg）"
+             要彩色请给相位（本板实测 --bayer bggr）"
         );
     }
     println!("  监听  ：http://{addr}/  与  http://{addr}/snapshot.jpg");
@@ -558,17 +587,42 @@ mod tests {
     }
 
     #[test]
-    fn bayer_defaults_to_gray() {
-        assert_eq!(run(&[]).unwrap().bayer, BayerPhase::Gray);
+    fn bayer_defaults_to_auto() {
+        assert_eq!(run(&[]).unwrap().bayer, BayerPhase::Auto);
         assert_eq!(
             run(&["--source", "pgm", "--pgm", "f.pgm"]).unwrap().bayer,
-            BayerPhase::Gray
+            BayerPhase::Auto
+        );
+    }
+
+    #[test]
+    fn device_and_r10f_default_to_auto_postfx() {
+        let dev = run(&["--source", "device"]).unwrap();
+        assert_eq!(
+            (dev.black, dev.gamma, dev.ae_target, dev.awb),
+            (12, 2.2, 100, true)
+        );
+        let r10f = run(&["--source", "r10f", "--r10f", "f.dma"]).unwrap();
+        assert_eq!(
+            (r10f.black, r10f.gamma, r10f.ae_target, r10f.awb),
+            (12, 2.2, 100, true)
+        );
+        let off = run(&["--source", "device", "--no-auto"]).unwrap();
+        assert_eq!(
+            (off.black, off.gamma, off.ae_target, off.awb),
+            (0, 1.0, 0, false)
+        );
+        let pgm = run(&["--source", "pgm", "--pgm", "f.pgm"]).unwrap();
+        assert_eq!(
+            (pgm.black, pgm.gamma, pgm.ae_target, pgm.awb),
+            (0, 1.0, 0, false)
         );
     }
 
     #[test]
     fn bayer_accepts_all_five_values() {
         for (arg, want) in [
+            ("auto", BayerPhase::Auto),
             ("gray", BayerPhase::Gray),
             ("rggb", BayerPhase::Rggb),
             ("bggr", BayerPhase::Bggr),
@@ -624,7 +678,11 @@ mod tests {
             (c.black, c.gamma, c.ae_target, c.awb),
             (DEF_BLACK, DEF_GAMMA, DEF_AE, true)
         );
-        assert!(postfx_desc(&c).contains("黑电平 -12"), "{}", postfx_desc(&c));
+        assert!(
+            postfx_desc(&c).contains("黑电平 -12"),
+            "{}",
+            postfx_desc(&c)
+        );
     }
 
     #[test]

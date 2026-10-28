@@ -153,7 +153,14 @@ const _: () = {
     assert!(offset_of!(FrameSlotHdr, flags) == 8);
     // ioctl 编号照头文件展开值钉死（与 driver/app/rs/src/ioctl.rs 对齐）；
     // `ANLOGIC_IOC_INFO` 量的是 `sizeof(struct anlogic_ioc_info) == 40`。
-    assert!(ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_INFO, 40) == 0xc028_7801);
+    assert!(
+        ioc(
+            IOC_READ | IOC_WRITE,
+            ANLOGIC_IOC_MAGIC,
+            ANLOGIC_IOC_INFO,
+            40
+        ) == 0xc028_7801
+    );
     assert!(
         ioc(
             IOC_READ,
@@ -193,9 +200,13 @@ pub struct FrameBufferInfo {
 }
 
 impl FrameBufferInfo {
-    /// 一帧像素需要的字节数（宽 × 高，单字节灰度）
+    /// 一槽内容需要的字节数。
+    ///
+    /// 不是宽×高：当前正式通路的一槽是 R10F（128 B 头 + packed RAW10 + 尾零），
+    /// 驱动报的 `slot_bytes` 才是真正要 mmap/读取的长度。旧 8 bit 灰度通路下
+    /// `slot_bytes == width*height`，两种布局共用这一条。
     pub fn frame_bytes(&self) -> usize {
-        self.width as usize * self.height as usize
+        self.slot_bytes as usize
     }
 }
 
@@ -369,11 +380,7 @@ impl FrameDevice {
             base: ptr,
             len: info.size as usize,
         };
-        let dev = FrameDevice {
-            file,
-            map,
-            info,
-        };
+        let dev = FrameDevice { file, map, info };
 
         // mailbox 定位靠 ioctl 报的 mb_off，不按常量猜
         if dev.mailbox_u32(offset_of!(FrameMailbox, magic)) != ANLOGIC_FRAME_MAGIC {
@@ -473,17 +480,17 @@ impl FrameDevice {
                 slot, self.info.slots
             )));
         }
-        if out.len() != self.info.frame_bytes() {
+        if out.len() < self.info.frame_bytes() {
             return Err(SlotError::Inconsistent(format!(
-                "目标缓冲 {} 字节与一帧 {} 字节不符",
+                "目标缓冲 {} 字节小于一槽内容 {} 字节",
                 out.len(),
                 self.info.frame_bytes()
             )));
         }
 
         // 本路在整块缓冲里的起点（见文件头）：槽区恒在路首、mailbox 紧随其后
-        let stream_off = self.info.mb_off as usize -
-                         self.info.stride as usize * self.info.slots as usize;
+        let stream_off =
+            self.info.mb_off as usize - self.info.stride as usize * self.info.slots as usize;
         let slot_off = stream_off + slot as usize * self.info.stride as usize;
         let base = unsafe { self.map.as_ptr().add(slot_off) };
 
@@ -615,7 +622,12 @@ mod tests {
     fn ioctl_numbers_match_header() {
         // 照抄 driver/app/rs/src/ioctl.rs 的同名用例：命令字一旦算错就当场响
         assert_eq!(
-            ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_INFO, 40),
+            ioc(
+                IOC_READ | IOC_WRITE,
+                ANLOGIC_IOC_MAGIC,
+                ANLOGIC_IOC_INFO,
+                40
+            ),
             0xc028_7801
         );
         assert_eq!(

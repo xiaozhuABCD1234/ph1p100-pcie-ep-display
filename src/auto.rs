@@ -8,11 +8,13 @@
 
 //!   1) **黑电平扣除**：IMX415 的 10bit black pedestal = 50，截成 8 位就是 12。不扣掉的话
 //!      gamma 会把这段台阶整体抬起来，暗部发灰、对比度也被吃掉。
-//!   2) **白平衡（AWB）**：灰世界法，以绿通道为参考（Bayer 里绿占两格、最接近亮度），
-//!      算出 R/B 增益把三通道均值拉平。只在彩色通路（3 通道）生效。
+//!   2) **白平衡（AWB）**：扣黑电平后的灰世界，以绿通道为参考。先排除接近饱和的
+//!      像素（max >= 250），再取三通道均值；画面被绿色墙面/衣服主导时它会把绿色
+//!      拉回中性，这是本板真实 CFA 下的物理结果（不是算法故障）。只有彩色通路生效。
 //!   3) **自动曝光（AE）**：以「gamma 编码后的中位数」为基准定一个数字增益。用中位数
 //!      而不是均值：对高光和大块暗背景都稳。而且 gamma 单调 ⇒
 //!      `median(gamma(x)) == gamma(median(x))`，所以目标亮度是**精确命中**的，不用迭代。
+//!      只提亮（gain ≥ 1），不压暗已经正常曝光的帧 —— 固定曝光传感器压暗只会白丢动态范围。
 //!   4) **gamma**：默认 2.2（`--auto` 时），把线性 RAW 映射到显示域。
 //!
 //! 两个实现上的要点：
@@ -30,6 +32,7 @@ const EMA: f32 = 0.35;
 /// 白平衡增益夹紧范围：±2 个八度，防止某个通道过曝时把另两个拉爆
 const WB_MIN: f32 = 0.25;
 const WB_MAX: f32 = 4.0;
+
 /// 数字增益夹紧范围
 const GAIN_MIN: f32 = 0.25;
 const GAIN_MAX: f32 = 64.0;
@@ -92,29 +95,40 @@ impl AutoLevel {
             return;
         }
 
-        // ---- 1. 采样直方图（已扣黑电平）----
-        // 采样步长直接作用在「像素」上而不是字节上，三通道抽样点数一致，不会偏色。
+        // ---- 1. 采样（扣黑电平；排除接近饱和的像素，避免灯管高光带偏均值）----
         let step = (npx / SAMPLE_TARGET).max(1);
-        let mut hist = [[0u32; 256]; 3];
-        let mut nsamp = 0u32;
+        let mut sum = [0u64; 3];
+        let mut cnt = 0u64;
         let mut i = 0usize;
         while i < npx {
             let off = i * channels;
-            for (c, h) in hist.iter_mut().enumerate().take(channels) {
-                h[buf[off + c].saturating_sub(self.black) as usize] += 1;
+            let mut mx = 0u8;
+            let mut v = [0u8; 3];
+            for c in 0..channels {
+                let x = buf[off + c].saturating_sub(self.black);
+                v[c] = x;
+                mx = mx.max(x);
             }
-            nsamp += 1;
+            if mx < 250 {
+                for c in 0..channels {
+                    sum[c] += v[c] as u64;
+                }
+                cnt += 1;
+            }
             i += step;
         }
-        if nsamp == 0 {
+        if cnt == 0 {
             return;
         }
 
         // ---- 2. 白平衡（灰世界，以绿为参考）----
         if channels == 3 && self.awb {
-            let m: Vec<f32> = (0..3).map(|c| hist_mean(&hist[c], nsamp)).collect();
+            let m = [
+                sum[0] as f32 / cnt as f32,
+                sum[1] as f32 / cnt as f32,
+                sum[2] as f32 / cnt as f32,
+            ];
             let mut wb = [1.0f32; 3];
-            // 绿通道亮到能用才当参考；否则本帧不动白平衡（宁可偏色也不放大噪声）
             if m[1] > 0.5 {
                 for c in [0usize, 2] {
                     if m[c] > 0.5 {
@@ -138,7 +152,9 @@ impl AutoLevel {
                 // 想让 gamma 编码后的中位数 == ae_target，则线性域的中位数该落在
                 // target_pre = 255 · (ae_target/255)^gamma
                 let target_pre = 255.0 * (self.ae_target as f32 / 255.0).powf(self.gamma);
-                let g = (target_pre / refv).clamp(GAIN_MIN, GAIN_MAX);
+                // 定焦/固定曝光的传感器：AE 只负责把欠曝帧提亮，不把已经正常的帧压暗。
+                // 压暗会白丢动态范围，还会让灯管等高光在 gamma 后偏色。
+                let g = (target_pre / refv).clamp(GAIN_MIN, GAIN_MAX).max(1.0);
                 self.gain = if self.primed { smooth(self.gain, g) } else { g };
             }
         } else {
@@ -160,6 +176,12 @@ impl AutoLevel {
                     buf[off + c] = lut[c * 16 + p][v.saturating_sub(black)];
                 }
             }
+        }
+        // ---- 5. 高光去饱和 ----
+        // 灯管等高光在传感器上已经接近/达到饱和，各通道 clipping 点不同会留下
+        // 品红/绿色边。只把「接近白」的像素往亮度拉，不碰正常彩色物体。
+        if channels == 3 {
+            desaturate_highlights(buf, npx);
         }
     }
 
@@ -195,16 +217,27 @@ impl AutoLevel {
     }
 }
 
-/// 直方图均值（只在已扣黑电平的值上算）
-fn hist_mean(h: &[u32; 256], n: u32) -> f32 {
-    if n == 0 {
-        return 0.0;
+/// 高光去饱和：输出域亮度 > 220 的像素按比例向亮度混合，最多 85%。
+/// 只处理 3 通道交错缓冲；npx 是像素数。
+fn desaturate_highlights(buf: &mut [u8], npx: usize) {
+    const START: f32 = 220.0;
+    const FULL: f32 = 255.0;
+    const MAX_MIX: f32 = 0.85;
+    for i in 0..npx {
+        let o = i * 3;
+        let r = buf[o] as f32;
+        let g = buf[o + 1] as f32;
+        let b = buf[o + 2] as f32;
+        let mx = r.max(g).max(b);
+        if mx <= START {
+            continue;
+        }
+        let t = ((mx - START) / (FULL - START)).clamp(0.0, 1.0) * MAX_MIX;
+        let y = 0.299 * r + 0.587 * g + 0.114 * b;
+        buf[o] = (r + (y - r) * t + 0.5) as u8;
+        buf[o + 1] = (g + (y - g) * t + 0.5) as u8;
+        buf[o + 2] = (b + (y - b) * t + 0.5) as u8;
     }
-    let mut s = 0f64;
-    for (v, &c) in h.iter().enumerate() {
-        s += v as f64 * c as f64;
-    }
-    (s / n as f64) as f32
 }
 
 /// 直方图的中位数所在格值（+0.5 取格中心）；空直方图返回 0
@@ -318,7 +351,10 @@ mod tests {
         let mut buf = make(8, 8, 3, |x, y, c| ((x * 7 + y * 11 + c * 23) % 256) as u8);
         let before = buf.clone();
         fx.apply(&mut buf, 8, 3);
-        assert_eq!(buf, before, "恒等参数不该改任何一个字节（尤其不能加抖动噪声）");
+        assert_eq!(
+            buf, before,
+            "恒等参数不该改任何一个字节（尤其不能加抖动噪声）"
+        );
     }
 
     #[test]
@@ -429,7 +465,38 @@ mod tests {
             spread < 12.0,
             "AWB 后三通道均值应当接近，实际 R={mr:.1} G={mg:.1} B={mb:.1}"
         );
-        assert!(fx.wb[0] > 1.5 && fx.wb[2] > 1.5, "红蓝增益应当被抬起来：{:?}", fx.wb);
+        assert!(
+            fx.wb[0] > 1.5 && fx.wb[2] > 1.5,
+            "红蓝增益应当被抬起来：{:?}",
+            fx.wb
+        );
+    }
+
+    #[test]
+    fn highlights_are_desaturated() {
+        let mut buf = make(8, 8, 3, |_, _, c| match c {
+            0 => 255,
+            1 => 250,
+            _ => 230,
+        });
+        desaturate_highlights(&mut buf, 64);
+        let p = [buf[0], buf[1], buf[2]];
+        let spread = p.iter().max().unwrap() - p.iter().min().unwrap();
+        assert!(spread < 8, "高光应当被拉白，实际 {p:?}");
+    }
+
+    #[test]
+    fn gray_world_gains_follow_the_frame() {
+        // 灰世界：R/G/B 均值 60/120/30 -> 增益应约 2.0 / 1.0 / 4.0（夹到 4.0 上限）
+        let mut fx = AutoLevel::new(0, 1.0, 0, true);
+        let mut buf = make(64, 64, 3, |_, _, c| match c {
+            0 => 60,
+            1 => 120,
+            _ => 30,
+        });
+        fx.apply(&mut buf, 64, 3);
+        assert!((fx.wb[0] - 2.0).abs() < 0.01, "R 增益 {:?}", fx.wb);
+        assert!((fx.wb[2] - 4.0).abs() < 0.01, "B 增益 {:?}", fx.wb);
     }
 
     #[test]
@@ -464,17 +531,20 @@ mod tests {
         fx.apply(&mut dark, 32, 1);
         let g1 = fx.gain;
         // 第一帧直接采用本帧算出的值：128 目标 / 中位数 20.5
-        assert!((g1 - 128.0 / 20.5).abs() < 0.01, "第一帧应当直接采用，实际 {g1}");
+        assert!(
+            (g1 - 128.0 / 20.5).abs() < 0.01,
+            "第一帧应当直接采用，实际 {g1}"
+        );
 
         let mut bright = make(32, 32, 1, |_, _, _| 200);
         fx.apply(&mut bright, 32, 1);
         let g2 = fx.gain;
-        let g_target = 128.0 / 200.5; // 本帧自己算出来的目标增益
+        // 本帧目标增益 128/200.5 < 1，被「只提亮不压暗」夹到 1；EMA 只往 1 走 35%。
+        let g_target = 1.0f32;
         assert!(
             g_target < g2 && g2 < g1,
             "第二帧应当只往目标走一部分：目标 {g_target:.3} < 实际 {g2:.3} < 上一帧 {g1:.3}"
         );
-        // 走了 35% 就是对数域 EMA：log g2 = 0.65·log g1 + 0.35·log g_target
         let want = (g1.ln() * 0.65 + g_target.ln() * 0.35).exp();
         assert!((g2 - want).abs() < 1e-3, "实际 {g2:.4} 期望 {want:.4}");
     }

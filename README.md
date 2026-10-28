@@ -1,221 +1,186 @@
-# display-stream —— 取帧 → JPEG → HTTP 推流
+# display-stream —— R10F 取帧 → 彩色 JPEG → HTTP 推流
 
-RK3588 上把安路 PH1P100 EP 送来的帧（相机整帧 3840×2160）取出来，编成 JPEG，由最小
-HTTP 服务推出去（MJPEG 连续流 + 单帧快照）。默认编成**单分量灰度 JPEG**；
-帧缓存里是 Bayer 马赛克时用 `--bayer <相位>` 做去马赛克，改推**三分量彩色 JPEG**。
-`--auto` 一键打开主机侧后处理（黑电平扣除 + gamma + AE + AWB），把「传感器 RAW
-直接显示就是又暗又偏色」这个默认状态改掉。
-Rust cargo 工程，无 C/C++ 源文件。
+RK3588 上把安路 PH1P100 EP 送来的相机帧取出、去马赛克/后处理、编成 JPEG，由最小
+HTTP 服务推出去（MJPEG 连续流 + 单帧快照）。
+
+> 2026-10-28 状态：当前正式通路是 **1920×1080 ROI、packed RAW10、R10F v1**，
+> 一帧传输 **2,592,768 B**（128 B 头 + 2,592,000 B 载荷 + 640 B 尾零）。
+> 驱动只创建一个 <code>/dev/ANLOGIC-PCI0_frame</code> 节点；B 路靠 <code>CTRL[8]</code> 选源，
+> 没有 <code>_frame_b</code> 节点。旧 README 里的 4K / 8.29 MB / 7.85 fps / <code>_frame_b</code>
+> 是 8bit 双路时代的历史，不适用于当前代码。
+
+## 快速开始
+
+板上（二进制已交叉编译到 aarch64）：
+
+~~~sh
+# 1) 设备单帧：读缓冲里现有/已 ARM 的一帧，彩色 + 后处理
+/root/display-stream-new --source device --scale 2 --port 18090
+# device/r10f 默认已开 --auto（黑电平/gamma/AWB/AE），相位默认 auto→RGGB
+# 浏览器/本机：
+curl -o /tmp/f.jpg http://<板子IP>:18090/snapshot.jpg
+
+# 2) 静态 PGM（frame_grab 已解包 R10F；最稳的离线路径）
+/root/frame_grab -n -o /tmp/f.pgm
+./display-stream --source pgm --pgm /tmp/f.pgm --auto --scale 2
+
+# 3) 离线回放一帧 R10F（.dma 从 R10F 魔数开始）
+./display-stream --source r10f --r10f fa.dma --auto --scale 2
+~~~
+
+一帧推完后不会自动再来一帧：当前设备源没有常驻 RKA1 ARM/ACK pump。
+要连续采集，需要外部循环：
+
+~~~sh
+link_ctl arm -r A
+/root/display-stream-new --source device --auto --scale 2 --port 18090 &
+# 取到一帧后：
+link_ctl ack
+~~~
+
+每次 ARM 只给一帧额度；不 ACK 会停在 HELD。详见 <code>docs/DATAFLOW.md</code> §9。
+
+## 数据链路（当前）
+
+~~~text
+IMX415 A/B 4K RAW10
+  -> checked CSI-2（ECC/VC/DT/WC/CRC/行数/FS-FE 裁决）
+  -> 偶数 ROI 1920x1080（X0=960, Y0=540, SKIP_ROWS=37）
+  -> cam_r10f_writer（128B 头 + packed RAW10 + 4KiB 尾零）
+  -> DDR3 双缓冲 -> ddr_frame_pusher
+  -> PCIe Gen2 x2 Posted MWr -> 主机一致性 DMA 槽
+  -> /dev/ANLOGIC-PCI0_frame（单槽、one-shot ARM/ACK）
+  -> display：R10F 解析 -> 5B/4px 解包 -> 去马赛克 -> 后处理 -> JPEG -> HTTP
+~~~
+
+槽内布局：16 B 槽头 + 112 B pad + R10F（128 B 头 + 2,592,000 B packed + 640 B 尾零）。
+槽步长 2,596,864 B；单槽总分配 2,600,960 B。
+
+## R10F 支持（2026-10-28 修复）
+
+<code>src/r10f.rs</code> 校验 magic/version/header_bytes/format/codec/valid_bits/packing/
+width/height/stride/raw_bytes/payload_bytes，并解包 5B/4px：
+
+~~~text
+b0=P0[9:2] b1=P1[9:2] b2=P2[9:2] b3=P3[9:2]
+b4={P3[1:0],P2[1:0],P1[1:0],P0[1:0]}
+8bit 预览 = 每个采样的高 8 位 = b0..b3
+~~~
+
+设备源按驱动报的 <code>slot_bytes</code> 读满一槽，再解析；不是 R10F 时才回落旧 8bit 路径。
+文件源 <code>--source r10f --r10f f.dma</code> 走同一解析器，用于离线回归。
+
+## 彩色相位：当前安装 A/B 均 RGGB
+
+### 已确证
+
+真实帧 2×2 四个格子的均值（frame A）：
+
+~~~text
+(0,0)=31.32  (0,1)=56.72
+(1,0)=56.68  (1,1)=35.85
+~~~
+
+两条绿对角只差 0.07%，主对角差 13.5% —— 绿在**反对角** (0,1)/(1,0)。
+马赛克里只有绿占两格，所以相位只可能是 **RGGB 或 BGGR**；
+<code>GBRG</code>/<code>GRBG</code>（绿在主对角）会出品红/绿棋盘，已排除。
+
+### 为什么取 RGGB
+
+- A/B 两路看同一间办公室；只有 RGGB 让两边告示牌都还原成**黄色**，
+  BGGR 会把它们都变蓝。同一块牌子不可能既黄又蓝，这是当前最强的一组同场景对照。
+- 用户对 <code>--bayer rggb</code> 的 A 路结果确认为“有点对”。
+- R10F 头 0x28 写 3(GBRG) 是 <code>SRC_BAYER_PHASE=0</code> 占位按 ROI 奇偶推导的，
+  <strong>不是测量值</strong>；不要拿它当相位。
+
+### 仍然存在的风险
+
+早期 BGGR 结论来自 180° 翻转的旧预览/另一套安装；如果当前模组实际是倒装，R/B 会互换。
+换模组、改支架、改 MIPI 走线、改 ROI 奇偶（X0/Y0/SKIP_ROWS）后必须用**已知色卡**重测。
+命令行可随时覆盖：
+
+~~~sh
+display-stream --source r10f --r10f fa.dma --bayer rggb --auto
+display-stream --source r10f --r10f fb.dma --bayer bggr --auto
+~~~
+
+<code>--bayer auto</code> 当前解析为 RGGB；它保留成独立名字，是为了以后换模组只改一处。
+
+## 后处理（<code>--auto</code>，device/r10f 默认开）
+
+| 项 | 预设 | 选项 | 说明 |
+| --- | --- | --- | --- |
+| 黑电平 | 12 | <code>--black 0..64</code> | IMX415 10bit pedestal 50 截成 8 位 = 12 |
+| gamma | 2.2 | <code>--gamma 1.0..4.0</code> | 线性 RAW -> 显示域 |
+| AE | 目标 100 | <code>--ae 0..250</code> | 只提亮（gain >= 1），不压暗正常曝光帧 |
+| AWB | 灰世界 | <code>--awb</code>/<code>--no-awb</code> | 扣黑后、排除 max>=250 的像素，再算 R/B 增益 |
+
+<code>--source device</code> / <code>--source r10f</code> 不给 <code>--auto</code> 也默认按上表开；
+<code>--no-auto</code> 可退回原样透传。synthetic/pgm 默认关，仍要显式 <code>--auto</code>。
+
+实现顺序：扣黑 -> 灰世界 AWB -> AE -> gamma LUT -> 高光去饱和 -> 4×4 有序抖动。
+高光去饱和只把输出域 max>220 的像素往亮度拉，避免灯管边缘品红/绿边。
+
+**关于“绿衣服不绿”**：这两帧里前景织物与白墙的相机色度几乎相同（差异 <2%）。
+任何让白墙变白全局 AWB 都会把它还原成中性；要强行保留绿色，只能把白墙也染绿，
+或做按区域/语义的白平衡。这是当前像素的事实，不是相位错。真要验证请拿已知色卡/
+已知颜色物体重拍。
 
 ## 构建
 
-    cargo build --release                                # 本机原生，产物 target/release/
-    cargo build --release --target aarch64-unknown-linux-gnu   # 给板子
-    cargo test --release                                 # 单元测试（编码/解析/路由）
+~~~sh
+cargo build --release
+cargo build --release --target aarch64-unknown-linux-gnu
+cargo test
+~~~
 
-交叉编译的链接器见 `.cargo/config.toml`（`aarch64-linux-gnu-gcc`），产物在
-`target/aarch64-unknown-linux-gnu/release/display-stream`。
+交叉链接器见 <code>.cargo/config.toml</code>（<code>aarch64-linux-gnu-gcc</code>），
+产物在 <code>target/aarch64-unknown-linux-gnu/release/display-stream</code>。
 
-## 运行
+## 命令行
 
-**本板推荐用法**（彩色 + 后处理，见下面两节的实测依据）：
+~~~text
+--source synthetic|pgm|r10f|device   数据源，默认 synthetic
+--pgm <路径>                         PGM 文件源（P5/P2 灰度）
+--r10f <路径>                        R10F 文件源（.dma，从魔数开始）
+--device <路径>                      设备节点，默认 /dev/ANLOGIC-PCI0_frame
+--width/--height                     合成源几何
+--fps <1..240>                       推流节奏，默认 15
+--quality <1..100>                   JPEG 质量，默认 80
+--scale <1|2|4|8>                    编码前降采样；彩色走 CFA binning
+--bayer <auto|gray|rggb|bggr|grbg|gbrg>  相位，默认 auto（当前 RGGB）
+--auto / --black / --gamma / --ae / --awb / --no-awb  后处理
+--port <端口>                        默认 8090
+--bind <地址>                        默认 0.0.0.0
+--timeout-ms <毫秒>                  设备等帧超时，默认 2000
+~~~
 
-    ./display-stream --source device --bayer gbrg --auto --fps 15
+## HTTP
 
-其它：
+~~~text
+/              内嵌网页（MJPEG）
+/stream.mjpg   MJPEG 连续流
+/snapshot.jpg  单帧 JPEG
+~~~
 
-    ./display-stream                                        # 合成源 640×480、15fps、端口 8090
-    ./display-stream --source pgm --pgm frame.pgm            # PGM 文件源（P5/P2 灰度图）
-    ./display-stream --source device --fps 30                # 设备源，默认节点见下
-    ./display-stream --source device --bayer gbrg            # 只去马赛克，不做后处理
-    ./display-stream --source device --auto                  # 灰度通路也能用（无 AWB）
-    ./display-stream --source device \
-        --device /dev/ANLOGIC-PCI0_frame_b --bayer gbrg      # B 路相机（另一颗传感器）
-
-参数：`--source synthetic|pgm|device`（默认 synthetic）、`--pgm <路径>`、
-`--device <节点>`（默认 `/dev/ANLOGIC-PCI0_frame` = A 路相机，需先加载驱动；
-B 路是 `/dev/ANLOGIC-PCI0_frame_b`，命令字完全相同）、
-`--width`/`--height`（合成源几何）、`--fps`（默认 15）、`--quality`（1..100，默认 80）、
-`--scale <1|2|4|8>`（编码前降采样，默认 1 = 不缩，见下面 `--scale` 一节）、
-`--bayer <gray|rggb|bggr|grbg|gbrg>`（默认 `gray`，实测应为 `gbrg`）、
-`--auto` / `--black` / `--gamma` / `--ae` / `--awb` / `--no-awb`（后处理，见下节）、
-`--port`（默认 8090）、`--bind`（默认 0.0.0.0）、`--timeout-ms`（设备源等帧超时，默认 2000）、
-`-h`。退出码：1 用法错、2 数据源起不来、3 服务起不来、4 设备连续 IO 失败。
-
-### `--bayer`：把帧当 Bayer 马赛克，出去马赛克的彩色图
-
-整帧按该相位做双线性去马赛克（`src/bayer.rs`，纯 Rust、无新依赖），再编三分量
-彩色 JPEG；MJPEG 与 `/snapshot.jpg` 两个端点都是彩色。`gray` 是默认值，也是旧版
-行为：帧当单分量灰度图，不去马赛克。
-
-**本板实测相位是 `gbrg`**（次选 `grbg`，两者逐像素只差红蓝互换），所以要彩色就写：
-
-    ./display-stream --source device --bayer gbrg --auto --fps 15
-
-> **本节的结论改过两次，记一下免得再绕**：早期写 `bggr`/`rggb`（错），后来改成
-> `grbg`（还是错，只对了一半：那一步定对了「绿在哪条对角线」，但红蓝谁上谁下判反了），
-> 2026-10-16 用**已知颜色的物体**才定死为 `gbrg`。证据图：
-> `/tmp/fpga-rk-img/20261016-2038_*`（同一场景同参数，只换 `--bayer`）。
-
-#### 第一步：绿在哪条对角线上（只靠数据就能定，很稳）
-
-取 2×2 四个格子自身的**原始均值**（静止场景连抓 5 帧完全一致）：
-
-| 格子 | 均值 |
-| --- | --- |
-| (偶行, 偶列) | 19.11 |
-| (奇行, 奇列) | 19.09 |
-| (偶行, 奇列) | 15.74 |
-| (奇行, 偶列) | 15.28 |
-
-同一个滤色片的两个采样点最接近、不同滤色片（红 vs 蓝）差得多：主对角线差 **0.1%**、
-反对角线差 **3%**，所以「两格同通道」的是**主对角线**。马赛克里唯一占两格的通道是绿
-→ 绿在主对角线 → 相位只能是 `grbg` 或 `gbrg`。
-
-（**绝对值随场景变，别拿去当判据**；要看的只是「哪条对角线两格几乎相等」这个关系。
-2026-10-16 换了个场景重测：主对角线 35.9 / 35.9（等），反对角线 25.5 / 23.3（差 9%）——
-关系不变。）
-
-旁证（拿 AWB 增益看很直观）：按 `bggr`/`rggb` 去马赛克时灰世界算出的 R/B 增益
-**恰好相等**（0.49 / 1.00 / 0.49）—— 那正是因为它们被接到了同一条对角线上（同一个
-物理通道）；按 `grbg`/`gbrg` 则是 1.4 / 1.0 / 1.5 这种「抬红蓝」的常规方向。
-
-#### 第二步：红蓝谁上谁下 —— 只能用已知颜色的物体定
-
-`grbg` 与 `gbrg` 逐像素只差 R/B 互换，所以**任何纯幅度指标对这两者给出完全相同的
-值**（「绿均值最高」「假彩色能量最低」都不行 —— 前两次结论反复就是栽在这儿）。
-唯一可靠的办法是让画面里出现**已知颜色的东西**，两个相位各出一张快照对比：
-
-    for ph in grbg gbrg; do
-      ./display-stream --source device --bayer $ph --auto --fps 2 --port 8097 &
-      sleep 11; curl -s -o /tmp/cmp_$ph.jpg http://127.0.0.1:8097/snapshot.jpg
-      kill %1; sleep 2
-    done
-
-本板 2026-10-16 的对照结果：
-
-| 画面里的物体 | 实际颜色 | 按 `grbg` | 按 `gbrg` |
-| --- | --- | --- | --- |
-| 展示墙的白色海报/白纸 | 白 | 米黄（假） | **白（对）** |
-| 设备上的黄色机柜 | 黄 | 蓝（假） | **黄（对）** |
-| HMI 触摸屏（白底界面） | 白 | 米色 | **白（对）** |
-
-通道互换会把白色以外的颜色整体翻过来，所以「白纸仍旧白、黄柜仍旧黄」的那一相位才对。
-
-#### 关于「相机转了个方向要不要换相位」
-
-**不用换。** 相位是**传感器 + 该路像素怎么进 FPGA** 的属性（CFA 长在传感器上、
-读出顺序固定），把相机（或整台设备）转 90°/180° 只是**画面内容**转了，帧里的
-马赛克排布一点没变 —— 换了朝向照样用 `--bayer gbrg`。
-
-只有下面这些情况才需要重新验相位：换了相机模组/子板、MIPI 走线或 lane 顺序改了、
-FPGA 侧的像素对齐/裁剪改动（例如 x 方向平移一个像素、或整帧镜像/转置），
-以及任何改动过 `csi_rx_*` 的场合。判据还是上面两步。
-
-已知限制：去马赛克只有双线性，没有边缘自适应，高频边缘会有假彩色锯齿；暗光下
-R/B 增益拉得很大，彩色噪点会明显（那属于信号太弱，不是算法问题）。白平衡与亮度
-由下面的 `--auto` 负责。
-
-### `--auto`：主机侧后处理（黑电平 + gamma + AE + AWB）
-
-FPGA 送过来的是**传感器 RAW**（10bit 只取高 8 位、传感器侧没有 AE/AWB/gamma），
-所以不做后处理就是「很暗 + 偏色」。`--auto` 在主机侧一键补上（`src/auto.rs`）：
-
-| 项 | `--auto` 预设 | 单项选项 | 作用 |
-| --- | --- | --- | --- |
-| 黑电平 | 12 | `--black <0..64>` | IMX415 的 10bit pedestal 50 截成 8 位 = 12；不扣掉 gamma 会把这段台阶整体抬起来 |
-| gamma | 2.2 | `--gamma <1.0..4.0>` | 线性 RAW → 显示域 |
-| AE | 目标 100 | `--ae <0..250>`（0 = 关） | 定数字增益，把 gamma 编码后的**中位数**打到目标亮度 |
-| AWB | 开 | `--awb` / `--no-awb` | 灰世界白平衡，以绿为参考（只在彩色相位下有效） |
-
-单项选项**优先于 `--auto`**，且与两者在命令行上的先后无关；不开 `--auto` 时全部
-默认关（逐字节原样透传，与旧版一致）。启动日志与每 5 秒的周期日志都会打出当前生效的
-黑电平/gamma/增益/白平衡系数。
-
-实现上三个要点：
-
-* 增益都在**线性域**算，最后合成成 `通道×16相位` 的 256 项查找表，逐像素只剩查表。
-* **抖动**：8 位输入配大增益必然丢灰度级（暗帧线性值只有 0..50 级），不抖就是明显色带；
-  所以查表带 4×4 有序抖动。反过来，若这张表恰好是一一映射（没丢级），就不抖。
-* 增益按帧做对数域 EMA 平滑（系数 0.35）抑制闪烁，第一帧直接采用不等收敛。
-
-注意：后处理跑在**已经截成 8 位**的数据上，大增益会成上限地放大台阶。真正想要好的
-暗光彩色，得让 FPGA 把 RAW10 传过来（那是另一件事，见仓库根目录的讨论）。
-
-### 4K（相机整帧直通 DDR3）
-
-FPGA 侧现在能把相机整幅 3840×2160 直通到 DDR3（见 `fpga/README.md`），
-主机侧只是把驱动按 4K 分配（`insmod anlogic_pci.ko frame_width=3840 frame_height=2160`）：
-
-    ./display-stream --source device --bayer gbrg --auto --fps 2
-
-设备源的几何是从驱动 ioctl 读的，所以**不用改本工具**；但要知道代价：
-一帧 829 万像素，本工具是单线程纯 Rust，`--auto` + 去马赛克 + JPEG 编码在 RK3588 上
-大概只有几 fps（`--fps` 只是上限，编不过来就以实际速度走）。想在 4K 下流畅推流，
-用 `--scale 2`（见下一节）就能到十几 fps，或者接受低帧率只看快照
-（`curl -o f.jpg http://<板子IP>:8090/snapshot.jpg`）。
-只取原始帧不走这个工具时用 `frame_grab -o f.pgm`（8.29MB/帧）。
-
-**两路同时看**：两颗相机各推各的，起两个实例、端口分开就是「两路同时出」：
-
-    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame   \
-        --bayer gbrg --auto --port 8098 &
-    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame_b \
-        --bayer gbrg --auto --port 8099 &
-
-实测（Gen2 ×2）：两路各 ≈7.85fps 送进来，两个实例同跑各约 3fps
-（瓶颈在 RK3588 这一侧的 MJPEG 编码，不在链路）。
-
-### `--scale`：编码前降采样（4K 想流畅就靠它）
-
-4K 单线程编码是这条通路最大的主机侧瓶颈。`--scale` 在编码前把帧缩到 1/2、1/4 或 1/8：
-
-| 输入 | 通路 | 每帧耗时 | 折算帧率 |
-| --- | --- | --- | --- |
-| 3840×2160 | 灰度 | 61.5 ms | 16.3 fps |
-| 3840×2160 → 1920×1080 | 灰度（盒式均值） | 36.8 ms | 27.2 fps |
-| 3840×2160 | 彩色 + `--auto` | 319 ms | 3.1 fps |
-| 3840×2160 → 1920×1080 | 彩色（**CFA binning**） | 69.6 ms | 14.4 fps |
-| 3840×2160 → 960×540 | 彩色（CFA binning） | 23.3 ms | 43 fps |
-
-（RK3588 实测，4K PGM 源、`--quality 80`。传感器真实帧率是 7.85 fps/路 ⇒ 1/2 已经够用。）
-
-两条通路的缩法不同，别想当然：
-
-* **灰度**：`src/scale.rs` 的盒式均值（`factor×factor` 块求和再归一化），按行累加实现 ——
-  逐像素算下标那版在 RK3588 上要 40ms，按行累加后约 20ms。
-* **彩色**：`bayer::bin_rgb` 做 **CFA binning** —— 2×2 单元里恰好 R/G/G/B 各一个采样，
-  按通道累加就是真正的传感器 binning（无插值、无假彩色）。它把「去马赛克 + 降采样」
-  合成一步，省掉那条 25MB 的全分辨率 RGB 中间缓冲；实测 4K 彩色的 327ms 里，大部分
-  花在去马赛克与全分辨率后处理上，JPEG 本身只占几十毫秒。
-* **不能**先缩 Bayer 再普通去马赛克：那等于把不同滤色片的采样当邻居插值，颜色会糊掉。
-* 只接受 1/2/4/8（2 的幂）：binning 要求块边界与 2×2 相位对齐。
-
-用法：
-
-    ./display-stream --source device --bayer gbrg --auto --scale 2 --fps 15
-
-两路同时（端口分开）：
-
-    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame \
-        --bayer gbrg --auto --scale 2 --port 8098 &
-    ./display-stream --source device --device /dev/ANLOGIC-PCI0_frame_b \
-        --bayer gbrg --auto --scale 2 --port 8099 &
-
-## 接口
-
-    /             网页（内嵌 MJPEG 流）
-    /stream.mjpg  MJPEG 连续流（multipart/x-mixed-replace）
-    /snapshot.jpg 单帧 JPEG
-
-`curl -o f.jpg http://<板子IP>:8090/snapshot.jpg` 抓一帧；`X-Frame-Seq` 等头带帧序号与几何。
-同时最多 16 条连接，超出直接回 503 并关闭；请求读 5s、请求头总限 10s、响应写 5s 超时，慢/不读的客户端会被关连接。
+<code>curl -o f.jpg http://<板子IP>:8090/snapshot.jpg</code> 抓一帧；响应头带帧序号/几何。
 
 ## 代码位置
 
-    src/driver.rs        驱动契约唯一落点：ioctl 编号、结构体布局、只读 mmap 与取帧时序
-    src/source/          synthetic / pgm / device 三种数据源（device 只是适配）
-    src/bayer.rs         Bayer 相位与双线性去马赛克（纯 Rust，`--bayer` 走这里）
-    src/auto.rs          主机侧后处理：黑电平 / AWB / AE / gamma / 有序抖动（`--auto` 走这里）
-    src/encode.rs        JPEG 编码（jpeg-encoder：灰度用 ColorType::Luma，彩色用 Rgb）
-    src/http.rs store.rs 最小 HTTP 服务、最新帧共享区（MJPEG 靠共享区拿下一帧）
+~~~text
+src/driver.rs        驱动 ABI：ioctl/结构体/mmap/槽读取
+src/r10f.rs          R10F 头校验 + packed RAW10 解包
+src/source/          synthetic / pgm / r10f_file / device
+src/bayer.rs         相位枚举 + 双线性去马赛克 + CFA binning
+src/auto.rs          黑电平 / 灰世界 AWB / AE / gamma / 高光去饱和 / 抖动
+src/encode.rs        JPEG（灰度 Luma / 彩色 RGB）
+src/http.rs store.rs 最小 HTTP 与最新帧共享区
+~~~
+
+## 已知限制
+
+- 设备源没有常驻 ARM/ACK pump，单帧快照可用，连续流要外部循环或后续补 pump。
+- 没有 CCM/镜头校正/3A 标定；颜色是“白参考 + 灰世界”级别，不是色彩管理级。
+- 只取 RAW10 高 8 位，暗部有量化损失；需要 10/16bit 通路要另改 Frame 类型。
+- 去马赛克是双线性，边缘有假彩色；需要 Malvar/边缘自适应可替换 <code>src/bayer.rs</code>。
+- R10F 头的 bayer_phase 不可信；换硬件后必须重测相位。
