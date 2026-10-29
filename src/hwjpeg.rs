@@ -420,7 +420,7 @@ impl HwJpeg {
         self.cap_queued -= 1;
         if len == 0 {
             self.requeue(BUF_CAPTURE_MPLANE, ci);
-            return Err(io::Error::new(io::ErrorKind::Other, "硬件编码返回空帧"));
+            return Err(io::Error::other("硬件编码返回空帧"));
         }
         out.clear();
         out.extend_from_slice(&self.cap[ci].bytes()[..len]);
@@ -571,10 +571,7 @@ impl HwJpeg {
                 self.reqbufs(buf_type, NBUFS as u32),
             )?;
             if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "驱动没给缓冲（REQBUFS 返回 0）",
-                ));
+                return Err(io::Error::other("驱动没给缓冲（REQBUFS 返回 0）"));
             }
             for i in 0..n {
                 let planes = step(&format!("QUERYBUF({tag} #{i})"), self.query(buf_type, i))?;
@@ -727,7 +724,7 @@ impl Drop for HwJpeg {
 fn map_plane(fd: i32, plane: &V4l2Plane) -> io::Result<Map> {
     let len = plane.length as usize;
     if len == 0 {
-        return Err(io::Error::new(io::ErrorKind::Other, "驱动给了零长度平面"));
+        return Err(io::Error::other("驱动给了零长度平面"));
     }
     let ptr = unsafe {
         libc::mmap(

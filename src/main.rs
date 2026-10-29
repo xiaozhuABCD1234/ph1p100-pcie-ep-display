@@ -794,16 +794,19 @@ fn produce_pair(
         .name("pair-capture".into())
         .spawn(move || {
             let mut pairs: u64 = 0;
+            let mut io_fails: u32 = 0;
             let mut last_log = Instant::now();
             loop {
                 match src.next_pair() {
                     Ok(pair) => {
                         pairs += 1;
+                        io_fails = 0;
                         if tx.send(pair).is_err() {
                             break; // 编码线程已退出
                         }
                     }
                     Err(SourceError::Timeout(why)) => {
+                        io_fails = 0;
                         if last_log.elapsed() >= Duration::from_secs(5) {
                             eprintln!("双路暂时没有新帧：{why}；{}", src.status());
                             last_log = Instant::now();
@@ -811,7 +814,12 @@ fn produce_pair(
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(SourceError::Io(e)) => {
-                        eprintln!("双路取帧 IO 失败：{e}");
+                        io_fails += 1;
+                        eprintln!("双路取帧 IO 失败（第 {io_fails} 次）：{e}");
+                        if io_fails >= 10 {
+                            eprintln!("双路设备连续 {io_fails} 次 IO 失败，退出");
+                            std::process::exit(EX_DEVICE as i32);
+                        }
                         std::thread::sleep(Duration::from_millis(100));
                     }
                 }

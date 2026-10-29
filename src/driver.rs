@@ -6,9 +6,9 @@
 //!
 //! 节点：`/dev/ANLOGIC-PCI<n>_frame`（收帧缓冲专用节点，不绑 BAR），只支持
 //! 只读 `mmap` + 帧就绪 `ioctl`。驱动侧实现见 `anlogic_pci_chrdev.c` /
-//! `anlogic_pci_frame.c`，参考用户态写法见 `driver/app/frame_grab.c`。
+//! `anlogic_pci_frame.c`，参考用户态写法见 `driver/app/rs/src/bin/frame_grab.rs`。
 //!
-//! 取帧时序（照抄 frame_grab.c 的顺序，不自己发明）：
+//! 取帧时序（照抄 frame_grab.rs 的顺序，不自己发明）：
 //!   1. `open(O_RDONLY)`，再 `flock(LOCK_EX|LOCK_NB)` 独占（一次只允许一个取帧进程）；
 //!   2. `ANLOGIC_IOCFRAMEINFO` 问缓冲的物理地址/大小/几何/序号；
 //!   3. 只读 `mmap` 整块缓冲，核对 mailbox 的 magic；
@@ -334,7 +334,7 @@ impl FrameDevice {
         }
         let file = unsafe { OwnedFd::from_raw_fd(fd) };
 
-        // 与 frame_grab.c 一样独占：两个进程同时取帧会互相抢槽
+        // 与 frame_grab.rs 一样独占：两个进程同时取帧会互相抢槽
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(ctx(
                 &format!("{} 已被其它进程占用（flock）", path.display()),
@@ -430,7 +430,7 @@ impl FrameDevice {
     }
 
     /// 读 mailbox 的一个 u32 字段。FPGA 是这块内存的唯一写者，读侧要 volatile
-    /// 加屏障，免得编译器合并/提前取值（与 frame_grab.c 的 mb_field 同义）。
+    /// 加屏障，免得编译器合并/提前取值（与 frame_grab.rs 的 mb_field 同义）。
     fn mailbox_u32(&self, field_off: usize) -> u32 {
         let addr = self
             .map
@@ -483,15 +483,28 @@ impl FrameDevice {
         })
     }
 
-    /// 取一槽的原始内容（从槽数据偏移起，长度 = 调用方给的 out.len()）。
-    /// 不检查槽头：双路模式 B 槽的槽头不由驱动补，R10F strict 会负责内容校验。
-    pub fn read_slot_raw(&self, slot: u32, out: &mut [u8]) -> Result<(), SlotError> {
+    /// 槽在整块 mmap 里的字节偏移（槽区起点 + slot*步长）。
+    /// 描述符自检已保证 `mb_off >= stride*slots`，这里只保留防御性检查。
+    fn slot_offset(&self, slot: u32) -> Result<usize, SlotError> {
         if slot >= self.info.slots {
             return Err(SlotError::Inconsistent(format!(
-                "槽位 {slot} 越界（共 {} 槽）",
+                "驱动报的槽位 {slot} 越界（共 {} 槽）",
                 self.info.slots
             )));
         }
+        let stream_off = self
+            .info
+            .mb_off
+            .checked_sub(self.info.stride.saturating_mul(self.info.slots))
+            .ok_or_else(|| SlotError::Inconsistent("mailbox 偏移落在槽区之前".into()))?;
+        let off = stream_off as usize + slot as usize * self.info.stride as usize;
+        Ok(off)
+    }
+
+    /// 取一槽的原始内容（从槽数据偏移起，长度 = 调用方给的 out.len()）。
+    /// 不检查槽头：双路模式 B 槽的槽头不由驱动补，R10F strict 会负责内容校验。
+    pub fn read_slot_raw(&self, slot: u32, out: &mut [u8]) -> Result<(), SlotError> {
+        let slot_off = self.slot_offset(slot)?;
         if out.len() < self.info.frame_bytes() {
             return Err(SlotError::Inconsistent(format!(
                 "目标缓冲 {} 字节小于一槽内容 {} 字节",
@@ -499,9 +512,6 @@ impl FrameDevice {
                 self.info.frame_bytes()
             )));
         }
-        let stream_off =
-            self.info.mb_off as usize - self.info.stride as usize * self.info.slots as usize;
-        let slot_off = stream_off + slot as usize * self.info.stride as usize;
         let src = unsafe {
             self.map
                 .as_ptr()
@@ -521,12 +531,7 @@ impl FrameDevice {
         expect_seq: u32,
         out: &mut [u8],
     ) -> Result<SlotRead, SlotError> {
-        if slot >= self.info.slots {
-            return Err(SlotError::Inconsistent(format!(
-                "驱动报的槽位 {} 越界（共 {} 槽）",
-                slot, self.info.slots
-            )));
-        }
+        let slot_off = self.slot_offset(slot)?;
         if out.len() < self.info.frame_bytes() {
             return Err(SlotError::Inconsistent(format!(
                 "目标缓冲 {} 字节小于一槽内容 {} 字节",
@@ -536,12 +541,9 @@ impl FrameDevice {
         }
 
         // 本路在整块缓冲里的起点（见文件头）：槽区恒在路首、mailbox 紧随其后
-        let stream_off =
-            self.info.mb_off as usize - self.info.stride as usize * self.info.slots as usize;
-        let slot_off = stream_off + slot as usize * self.info.stride as usize;
         let base = unsafe { self.map.as_ptr().add(slot_off) };
 
-        // 顺序：先 seq，再 len/flags（与 frame_grab.c 一致）
+        // 顺序：先 seq，再 len/flags（与 frame_grab.rs 一致）
         let hdr_seq = volatile_u32(unsafe { base.add(offset_of!(FrameSlotHdr, seq)) });
         let hdr_len = volatile_u32(unsafe { base.add(offset_of!(FrameSlotHdr, len)) });
         let hdr_flags = volatile_u32(unsafe { base.add(offset_of!(FrameSlotHdr, flags)) });
@@ -603,7 +605,7 @@ fn volatile_u32(p: *const u8) -> u32 {
     v
 }
 
-/// 描述符自检：与 frame_grab.c 的 descriptor_check 同口径，宁可启动就报错，
+/// 描述符自检：与 frame_grab.rs 的 descriptor_check 同口径，宁可启动就报错，
 /// 也不要拿着对不上的地址去算偏移。
 fn check_descriptor(i: &FrameBufferInfo) -> Result<(), String> {
     if i.phys_addr == 0

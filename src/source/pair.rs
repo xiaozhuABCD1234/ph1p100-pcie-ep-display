@@ -283,7 +283,7 @@ impl PairSource {
 }
 
 fn slot_err(e: crate::driver::SlotError) -> SourceError {
-    SourceError::Io(io::Error::new(io::ErrorKind::Other, e.to_string()))
+    SourceError::Io(io::Error::other(e.to_string()))
 }
 
 fn decode(raw: &[u8], info: &FrameBufferInfo) -> Result<Frame, String> {

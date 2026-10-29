@@ -382,8 +382,6 @@ mod tests {
         }
     }
 
-    use super::*;
-
     /// 把 RGB8 按相位图抽成 Bayer 马赛克（测试用的「反向」操作）
     fn mosaic(rgb: &[u8], width: usize, height: usize, quad: [u8; 4]) -> Vec<u8> {
         let mut out = vec![0u8; width * height];

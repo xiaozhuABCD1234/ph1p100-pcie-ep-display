@@ -166,7 +166,7 @@ impl AutoLevel {
         // 逐像素查表是热路径：把通道数分成 3 和 1 两种展开，省掉内层循环与
         // 每次重算的 dither 下标。帧大小与几何在这之前已经校验过。
         let lut = build_lut(channels, self.gain, &self.wb, self.gamma);
-        let black = self.black as u8;
+        let black = self.black;
         if channels == 3 {
             for y in 0..(npx / width) {
                 let drow = (y & 3) * 4;
@@ -384,7 +384,7 @@ mod tests {
         let mut fx = AutoLevel::new(6, 2.0, 96, true);
         fx.apply(&mut fused, w, 3);
         let lut = build_lut(3, fx.gain, &fx.wb, fx.gamma);
-        let black = fx.black as u8;
+        let black = fx.black;
 
         let mut want = input.clone();
         for y in 0..h {
