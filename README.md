@@ -7,10 +7,10 @@ RK3588 上从 `/dev/ANLOGIC-PCI0_frame` 取帧，做去马赛克/后处理/JPEG 
 
 | 位流 | 帧内容 | 用法 |
 |---|---|---|
-| 当前板载 JPEG 位流 | 1920×1088 单路灰度（R10F 或旧 8 bit） | `--source device --bayer gray` |
+| 当前板载 JPEG 位流 | 1920×1088 单路灰度（R10F 取 RAW10 高 8 位，或旧 8 bit 写者） | `--source device --bayer gray` |
 | 4K 采集位流 | 3840×2160 packed RAW10、整帧 10,371,072 B | `--source device`，默认自动 2×2 binning |
 
-> 硬件 JPEG **压缩码流**（BPR1/JPEG）不由本程序解码；本程序只处理非压缩 R10F
+> 硬件 JPEG **压缩码流**不由本程序解码；本程序只处理非压缩 R10F（`codec=0`）
 > 与旧 8 bit 灰度。压缩→NPU 链路由根仓 `tools/board/` 的脚本处理。
 
 ## 目录与职责
